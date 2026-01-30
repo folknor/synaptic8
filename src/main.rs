@@ -386,6 +386,7 @@ struct App {
     pending_changes: PendingChanges,
     changes_scroll: u16,
     mark_preview: MarkPreview, // Preview of additional changes when marking
+    mark_confirm_scroll: u16,
     // Search
     search_index: Option<SearchIndex>,
     search_query: String,
@@ -432,6 +433,7 @@ impl App {
             pending_changes: PendingChanges::default(),
             changes_scroll: 0,
             mark_preview: MarkPreview::default(),
+            mark_confirm_scroll: 0,
             search_index: None,
             search_query: String::new(),
             search_results: None,
@@ -954,6 +956,7 @@ impl App {
                 additional_removes,
                 download_size,
             };
+            self.mark_confirm_scroll = 0;
             self.state = AppState::ShowingMarkConfirm;
         } else {
             // No additional changes, just apply directly
@@ -1035,6 +1038,9 @@ impl App {
         self.calculate_pending_changes();
         self.apply_current_filter();
         self.update_status_message();
+
+        // Show changes preview so user can see all dependencies
+        self.show_changes_preview();
     }
 
     fn unmark_all(&mut self) {
@@ -1375,8 +1381,8 @@ fn main() -> Result<()> {
                                 app.next_details_tab();
                             }
                         }
-                        KeyCode::Char('a') => app.mark_all_upgrades(),
-                        KeyCode::Char('n') => app.unmark_all(),
+                        KeyCode::Char('a') | KeyCode::Char('x') => app.mark_all_upgrades(),
+                        KeyCode::Char('n') | KeyCode::Char('N') => app.unmark_all(),
                         KeyCode::Char('d') => app.toggle_details_tab(),
                         KeyCode::Char('c') => app.show_changelog(),
                         KeyCode::Char('s') => app.show_settings(),
@@ -1412,6 +1418,12 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                             app.cancel_mark();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.mark_confirm_scroll = app.mark_confirm_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.mark_confirm_scroll = app.mark_confirm_scroll.saturating_add(1);
                         }
                         _ => {}
                     },
@@ -1657,9 +1669,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let help_text = match app.state {
         AppState::Listing => {
             if app.search_results.is_some() {
-                "/:Search │ Esc:Clear │ Space:Mark │ d:Deps │ c:Changelog │ s:Settings │ u:Apply │ q:Quit"
+                "/:Search │ Esc:Clear │ Space:Mark │ x:All │ N:None │ d:Deps │ u:Apply │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ d:Deps │ c:Changelog │ s:Settings │ u:Apply │ r:Refresh │ q:Quit"
+                "/:Search │ Space:Mark │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ r:Refresh │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
@@ -2095,11 +2107,26 @@ fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
         "Total download: {}",
         PackageInfo::size_str(preview.download_size)
     )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "y/Enter: Accept │ n/Esc: Cancel │ ↑↓: Scroll",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Calculate max package name width for modal sizing
+    let max_name_len = preview.additional_upgrades.iter()
+        .chain(preview.additional_installs.iter())
+        .chain(preview.additional_removes.iter())
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
 
     // Calculate modal size based on content
     let content_height = lines.len() as u16 + 2; // +2 for borders
-    let modal_width = 60.min(area.width.saturating_sub(4));
-    let modal_height = content_height.min(area.height.saturating_sub(2));
+    // Width: at least 50, up to content width + padding, max 80% of screen
+    let content_width = (max_name_len + 10).max(45) as u16;
+    let modal_width = content_width.min(area.width * 8 / 10);
+    let modal_height = content_height.min(area.height.saturating_sub(4));
     let modal_x = area.x + (area.width - modal_width) / 2;
     let modal_y = area.y + (area.height - modal_height) / 2;
     let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
@@ -2113,6 +2140,7 @@ fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta)),
         )
+        .scroll((app.mark_confirm_scroll, 0))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(modal, modal_area);
