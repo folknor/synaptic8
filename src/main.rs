@@ -218,6 +218,7 @@ enum AppState {
     ShowingChanges,     // Final confirmation before applying all changes
     ShowingChangelog,   // Viewing package changelog
     ShowingSettings,    // Settings/preferences view
+    EnteringPassword,   // Entering sudo password
     Upgrading,
     Done,
 }
@@ -276,7 +277,7 @@ impl Default for Settings {
 
 /// Result of attempting to apply changes
 enum ApplyResult {
-    NotRoot,
+    NeedsPassword,
     NeedsCommit,
 }
 
@@ -403,6 +404,8 @@ struct App {
     col_width_section: u16,
     col_width_installed: u16,
     col_width_candidate: u16,
+    // Sudo password input
+    sudo_password: String,
 }
 
 impl App {
@@ -442,6 +445,7 @@ impl App {
             col_width_section: 7,
             col_width_installed: 9,
             col_width_candidate: 9,
+            sudo_password: String::new(),
         };
 
         app.reload_packages()?;
@@ -1167,9 +1171,9 @@ impl App {
 
     fn apply_changes(&mut self) -> ApplyResult {
         if !Self::is_root() {
-            self.state = AppState::Listing;
-            self.status_message = "Root privileges required. Run with sudo.".to_string();
-            return ApplyResult::NotRoot;
+            self.sudo_password.clear();
+            self.state = AppState::EnteringPassword;
+            return ApplyResult::NeedsPassword;
         }
 
         self.state = AppState::Upgrading;
@@ -1200,6 +1204,77 @@ impl App {
                 self.state = AppState::Done;
                 self.status_message = format!("Error: {}. Press 'q' to quit or 'r' to refresh.", e);
             }
+        }
+
+        // Clear state after commit
+        self.user_marked.clear();
+        self.pending_changes = PendingChanges::default();
+        self.search_index = None;
+
+        Ok(())
+    }
+
+    /// Commit changes using sudo -S (password piped to stdin)
+    fn commit_with_sudo(&mut self) -> Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        println!("\n=== Applying changes with sudo ===\n");
+
+        // Build the apt-get command
+        let mut args = vec!["apt-get".to_string(), "-y".to_string()];
+
+        // Collect packages to install/upgrade
+        let to_install: Vec<&str> = self.pending_changes.to_install.iter()
+            .chain(self.pending_changes.to_upgrade.iter())
+            .chain(self.pending_changes.auto_install.iter())
+            .map(|s| s.as_str())
+            .collect();
+
+        // Collect packages to remove
+        let to_remove: Vec<String> = self.pending_changes.to_remove.iter()
+            .chain(self.pending_changes.auto_remove.iter())
+            .map(|s| format!("{}-", s))  // apt-get syntax for remove
+            .collect();
+
+        if !to_install.is_empty() || !to_remove.is_empty() {
+            args.push("install".to_string());
+            for pkg in &to_install {
+                args.push(pkg.to_string());
+            }
+            for pkg in &to_remove {
+                args.push(pkg.clone());
+            }
+        }
+
+        // Run sudo -S apt-get ...
+        let mut child = Command::new("sudo")
+            .arg("-S")
+            .args(&args)
+            .stdin(Stdio::piped())
+            .spawn()?;
+
+        // Write password to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            writeln!(stdin, "{}", self.sudo_password)?;
+        }
+
+        // Clear password from memory
+        self.sudo_password.clear();
+
+        // Wait for completion
+        let status = child.wait()?;
+
+        if status.success() {
+            println!("\n=== Changes applied successfully ===");
+            self.output_lines.push("Changes applied successfully.".to_string());
+            self.state = AppState::Done;
+            self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
+        } else {
+            println!("\n=== Error applying changes ===");
+            self.output_lines.push("Error: apt-get failed. Check password or permissions.".to_string());
+            self.state = AppState::Done;
+            self.status_message = "Error: apt-get failed. Press 'q' to quit or 'r' to refresh.".to_string();
         }
 
         // Clear state after commit
@@ -1332,8 +1407,8 @@ fn main() -> Result<()> {
                     AppState::ShowingChanges => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
                             match app.apply_changes() {
-                                ApplyResult::NotRoot => {
-                                    // Status message already set, just continue
+                                ApplyResult::NeedsPassword => {
+                                    // Will show password input
                                 }
                                 ApplyResult::NeedsCommit => {
                                     // Exit TUI temporarily for apt output
@@ -1365,6 +1440,39 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             app.changes_scroll = app.changes_scroll.saturating_add(1);
+                        }
+                        _ => {}
+                    },
+                    AppState::EnteringPassword => match key.code {
+                        KeyCode::Esc => {
+                            app.sudo_password.clear();
+                            app.state = AppState::Listing;
+                        }
+                        KeyCode::Enter => {
+                            // Exit TUI temporarily for apt output
+                            disable_raw_mode()?;
+                            io::stdout().execute(LeaveAlternateScreen)?;
+
+                            // Run the commit with sudo
+                            let _ = app.commit_with_sudo();
+
+                            // Wait for user to acknowledge
+                            println!("\nPress Enter to continue...");
+                            let mut input = String::new();
+                            let _ = std::io::stdin().read_line(&mut input);
+
+                            // Re-enter TUI
+                            enable_raw_mode()?;
+                            io::stdout().execute(EnterAlternateScreen)?;
+
+                            // Refresh the cache
+                            let _ = app.refresh_cache();
+                        }
+                        KeyCode::Backspace => {
+                            app.sudo_password.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.sudo_password.push(c);
                         }
                         _ => {}
                     },
@@ -1492,6 +1600,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingSettings => {
             render_settings_view(frame, app, main_chunks[1]);
         }
+        AppState::EnteringPassword => {
+            render_password_input(frame, app, main_chunks[1]);
+        }
         AppState::Upgrading | AppState::Done => {
             let output_text = app.output_lines.join("\n");
             let output = Paragraph::new(output_text)
@@ -1508,6 +1619,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChanges => Style::default().fg(Color::Cyan),
         AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
         AppState::ShowingSettings => Style::default().fg(Color::Yellow),
+        AppState::EnteringPassword => Style::default().fg(Color::Yellow),
         AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
     };
@@ -1544,6 +1656,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChanges => "y/Enter:Apply │ n/Esc:Cancel │ ↑↓:Scroll",
         AppState::ShowingChangelog => "↑↓/PgUp/PgDn:Scroll │ Esc/q:Close",
         AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
+        AppState::EnteringPassword => "Enter:Submit │ Esc:Cancel │ Type password...",
         AppState::Upgrading => "Applying changes...",
         AppState::Done => "r:Refresh │ q:Quit",
     };
@@ -2203,4 +2316,41 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
         );
 
     frame.render_widget(settings, area);
+}
+
+fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
+    let modal_width = 50.min(area.width.saturating_sub(4));
+    let modal_height = 7;
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    // Show asterisks for password
+    let password_display = "*".repeat(app.sudo_password.len());
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter sudo password:",
+            Style::default().bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("> "),
+            Span::styled(&password_display, Style::default().fg(Color::Yellow)),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+        ]),
+    ];
+
+    let modal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Authentication Required ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+
+    frame.render_widget(modal, modal_area);
 }
