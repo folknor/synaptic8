@@ -287,6 +287,7 @@ struct MarkPreview {
     package_name: String,
     is_marking: bool, // true = marking for install, false = unmarking
     additional_installs: Vec<String>,
+    additional_upgrades: Vec<String>,
     additional_removes: Vec<String>,
     download_size: u64,
 }
@@ -298,6 +299,7 @@ struct PendingChanges {
     to_upgrade: Vec<String>,
     to_remove: Vec<String>,
     auto_install: Vec<String>,
+    auto_upgrade: Vec<String>,
     auto_remove: Vec<String>,
     download_size: u64,
     install_size_change: i64,
@@ -905,6 +907,7 @@ impl App {
 
         // Get the diff - what additional changes would occur
         let mut additional_installs = Vec::new();
+        let mut additional_upgrades = Vec::new();
         let mut additional_removes = Vec::new();
         let mut download_size: u64 = 0;
 
@@ -925,7 +928,12 @@ impl App {
                     if let Some(cand) = pkg.candidate() {
                         download_size += cand.size();
                     }
-                    additional_installs.push(pkg_name);
+                    // Distinguish between new installs and upgrades
+                    if pkg.is_installed() {
+                        additional_upgrades.push(pkg_name);
+                    } else {
+                        additional_installs.push(pkg_name);
+                    }
                 } else if pkg.marked_delete() {
                     additional_removes.push(pkg_name);
                 }
@@ -937,11 +945,12 @@ impl App {
         self.apply_current_filter();
 
         // If there are additional changes, show the confirmation popup
-        if !additional_installs.is_empty() || !additional_removes.is_empty() {
+        if !additional_installs.is_empty() || !additional_upgrades.is_empty() || !additional_removes.is_empty() {
             self.mark_preview = MarkPreview {
                 package_name: name.to_string(),
                 is_marking: true,
                 additional_installs,
+                additional_upgrades,
                 additional_removes,
                 download_size,
             };
@@ -952,6 +961,7 @@ impl App {
                 package_name: name.to_string(),
                 is_marking: true,
                 additional_installs: Vec::new(),
+                additional_upgrades: Vec::new(),
                 additional_removes: Vec::new(),
                 download_size,
             };
@@ -1050,7 +1060,7 @@ impl App {
                     if is_user {
                         self.pending_changes.to_upgrade.push(name);
                     } else {
-                        self.pending_changes.auto_install.push(name);
+                        self.pending_changes.auto_upgrade.push(name);
                     }
                 } else {
                     if is_user {
@@ -1228,6 +1238,7 @@ impl App {
         let to_install: Vec<&str> = self.pending_changes.to_install.iter()
             .chain(self.pending_changes.to_upgrade.iter())
             .chain(self.pending_changes.auto_install.iter())
+            .chain(self.pending_changes.auto_upgrade.iter())
             .map(|s| s.as_str())
             .collect();
 
@@ -2037,6 +2048,20 @@ fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
+    if !preview.additional_upgrades.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("The following {} packages will be UPGRADED:", preview.additional_upgrades.len()),
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        for name in &preview.additional_upgrades {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {}", name),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
     if !preview.additional_installs.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("The following {} packages will be INSTALLED:", preview.additional_installs.len()),
@@ -2132,6 +2157,20 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(""));
     }
 
+    if !app.pending_changes.auto_upgrade.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "AUTO-UPGRADE (dependencies) ({}):",
+                app.pending_changes.auto_upgrade.len()
+            ),
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        for name in &app.pending_changes.auto_upgrade {
+            lines.push(Line::from(format!("  ↑ {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
     if !app.pending_changes.auto_install.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
@@ -2141,7 +2180,7 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::Cyan).bold(),
         )));
         for name in &app.pending_changes.auto_install {
-            lines.push(Line::from(format!("  A {}", name)));
+            lines.push(Line::from(format!("  + {}", name)));
         }
         lines.push(Line::from(""));
     }
