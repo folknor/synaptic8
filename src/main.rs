@@ -194,6 +194,7 @@ enum FocusedPane {
 enum DetailsTab {
     Info,
     Dependencies,
+    ReverseDeps,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -622,9 +623,39 @@ impl App {
     fn toggle_details_tab(&mut self) {
         self.details_tab = match self.details_tab {
             DetailsTab::Info => DetailsTab::Dependencies,
-            DetailsTab::Dependencies => DetailsTab::Info,
+            DetailsTab::Dependencies => DetailsTab::ReverseDeps,
+            DetailsTab::ReverseDeps => DetailsTab::Info,
         };
         self.detail_scroll = 0;
+    }
+
+    fn get_selected_reverse_dependencies(&self) -> Vec<(String, String)> {
+        // Returns: Vec<(dep_type, package_that_depends_on_us)>
+        let mut rdeps = Vec::new();
+
+        let pkg_name = match self.selected_package() {
+            Some(p) => p.name.clone(),
+            None => return rdeps,
+        };
+
+        let pkg = match self.cache.get(&pkg_name) {
+            Some(p) => p,
+            None => return rdeps,
+        };
+
+        // Get reverse dependencies
+        let rdep_map = pkg.rdepends();
+
+        for (dep_type, deps) in rdep_map.iter() {
+            let type_str = format!("{:?}", dep_type);
+            for dep in deps {
+                for base_dep in dep.iter() {
+                    rdeps.push((type_str.clone(), base_dep.name().to_string()));
+                }
+            }
+        }
+
+        rdeps
     }
 
     fn toggle_current(&mut self) {
@@ -1412,14 +1443,21 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let rdeps_style = if app.details_tab == DetailsTab::ReverseDeps {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let mut content = vec![
         Line::from(vec![
             Span::styled("[Info]", info_style),
             Span::raw(" "),
             Span::styled("[Deps]", deps_style),
-            Span::styled("  (d to switch)", Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled("[RDeps]", rdeps_style),
         ]),
+        Line::from(Span::styled("  (d to switch)", Style::default().fg(Color::DarkGray))),
         Line::from(""),
     ];
 
@@ -1520,6 +1558,57 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
             }
+            DetailsTab::ReverseDeps => {
+                let rdeps = app.get_selected_reverse_dependencies();
+
+                if rdeps.is_empty() {
+                    content.push(Line::from(Span::styled(
+                        "No reverse dependencies",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    content.push(Line::from(Span::styled(
+                        format!("{} packages depend on this:", rdeps.len()),
+                        Style::default().fg(Color::Cyan).bold(),
+                    )));
+                    content.push(Line::from(""));
+
+                    // Group by dep type
+                    let mut current_type = String::new();
+
+                    for (dep_type, pkg_name) in rdeps {
+                        if dep_type != current_type {
+                            if !current_type.is_empty() {
+                                content.push(Line::from(""));
+                            }
+                            content.push(Line::from(Span::styled(
+                                format!("{}:", dep_type),
+                                Style::default().fg(Color::Cyan).bold(),
+                            )));
+                            current_type = dep_type;
+                        }
+
+                        // Check if the depending package is installed
+                        let is_installed = app.cache.get(&pkg_name)
+                            .map(|p| p.is_installed())
+                            .unwrap_or(false);
+
+                        let style = if is_installed {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+
+                        let symbol = if is_installed { "✓" } else { "○" };
+                        content.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(symbol, style),
+                            Span::raw(" "),
+                            Span::styled(pkg_name, style),
+                        ]));
+                    }
+                }
+            }
         }
     } else {
         content.push(Line::from(Span::styled(
@@ -1531,6 +1620,7 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = match app.details_tab {
         DetailsTab::Info => " Details ",
         DetailsTab::Dependencies => " Dependencies ",
+        DetailsTab::ReverseDeps => " Reverse Deps ",
     };
 
     let details = Paragraph::new(content)

@@ -17,11 +17,13 @@ apt-tui now uses `rust-apt` for proper libapt-pkg integration with full dependen
   - [x] SQLite FTS5 in-memory index
   - [x] ~2s build time on first search, instant thereafter
 - [x] Dependencies tab in details pane
-  - [x] Press 'd' to toggle between Info and Deps tabs
+  - [x] Press 'd' to cycle Info → Deps → RDeps tabs
   - [x] Shows Depends, Pre-Depends, etc.
   - [x] Green ✓ for installed deps, yellow ○ for missing
+- [x] Reverse dependencies view
+  - [x] Shows packages that depend on the selected package
+  - [x] Grouped by dependency type
 - [ ] Changelog viewer (`apt changelog`)
-- [ ] Reverse dependencies view
 
 ### Authentication
 - [ ] Sudo integration for actual installs
