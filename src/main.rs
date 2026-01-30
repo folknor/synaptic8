@@ -957,11 +957,9 @@ impl App {
 
     /// Restore cache marks to match user_marked state
     fn restore_marks(&mut self) {
-        // Clear all marks
-        for pkg in self.cache.packages(&PackageSort::default()) {
-            if pkg.marked_install() || pkg.marked_delete() || pkg.marked_upgrade() {
-                pkg.mark_keep();
-            }
+        // Nuclear option: reload cache to guarantee clean state
+        if let Ok(new_cache) = Cache::new::<&str>(&[]) {
+            self.cache = new_cache;
         }
 
         // Re-apply only user-marked packages
