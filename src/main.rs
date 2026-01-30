@@ -876,6 +876,7 @@ impl App {
     }
 
     /// Preview what additional changes would occur if we mark this package
+    /// Does NOT apply the changes - just calculates and shows the preview
     fn preview_mark(&mut self, name: &str) {
         // Get current state of all packages before marking
         let before: std::collections::HashSet<String> = self
@@ -884,7 +885,7 @@ impl App {
             .map(|p| p.name().to_string())
             .collect();
 
-        // Temporarily mark the package
+        // Temporarily mark the package to see what would happen
         if let Some(pkg) = self.cache.get(name) {
             pkg.mark_install(true, true);
             pkg.protect();
@@ -893,14 +894,12 @@ impl App {
         // Resolve dependencies
         if let Err(e) = self.cache.resolve(true) {
             self.status_message = format!("Dependency error: {}", e);
-            // Undo the mark
-            if let Some(pkg) = self.cache.get(name) {
-                pkg.mark_keep();
-            }
+            // Undo and return
+            self.restore_marks();
             return;
         }
 
-        // Get new state after marking
+        // Get the diff - what additional changes would occur
         let mut additional_installs = Vec::new();
         let mut additional_removes = Vec::new();
         let mut download_size: u64 = 0;
@@ -918,7 +917,7 @@ impl App {
 
             // Only show packages that weren't already marked
             if !before.contains(&pkg_name) {
-                if pkg.marked_install() {
+                if pkg.marked_install() || pkg.marked_upgrade() {
                     if let Some(cand) = pkg.candidate() {
                         download_size += cand.size();
                     }
@@ -928,6 +927,9 @@ impl App {
                 }
             }
         }
+
+        // UNDO - restore cache to previous state before showing preview
+        self.restore_marks();
 
         // If there are additional changes, show the confirmation popup
         if !additional_installs.is_empty() || !additional_removes.is_empty() {
@@ -940,49 +942,65 @@ impl App {
             };
             self.state = AppState::ShowingMarkConfirm;
         } else {
-            // No additional changes, just confirm the mark
+            // No additional changes, just apply directly
+            self.mark_preview = MarkPreview {
+                package_name: name.to_string(),
+                is_marking: true,
+                additional_installs: Vec::new(),
+                additional_removes: Vec::new(),
+                download_size,
+            };
             self.confirm_mark();
         }
     }
 
-    /// User confirmed the mark, finalize it
+    /// Restore cache marks to match user_marked state
+    fn restore_marks(&mut self) {
+        // Clear all marks
+        for pkg in self.cache.packages(&PackageSort::default()) {
+            if pkg.marked_install() || pkg.marked_delete() || pkg.marked_upgrade() {
+                pkg.mark_keep();
+            }
+        }
+
+        // Re-apply only user-marked packages
+        for name in self.user_marked.keys() {
+            if let Some(pkg) = self.cache.get(name) {
+                pkg.mark_install(true, true);
+                pkg.protect();
+            }
+        }
+
+        // Resolve dependencies
+        if !self.user_marked.is_empty() {
+            let _ = self.cache.resolve(true);
+        }
+    }
+
+    /// User confirmed the mark, now actually apply it
     fn confirm_mark(&mut self) {
         let name = self.mark_preview.package_name.clone();
+
+        // Now actually apply the mark
+        if let Some(pkg) = self.cache.get(&name) {
+            pkg.mark_install(true, true);
+            pkg.protect();
+        }
+        let _ = self.cache.resolve(true);
+
+        // Record in user_marked
         self.user_marked.insert(name, true);
+
+        self.mark_preview = MarkPreview::default();
         self.calculate_pending_changes();
         self.apply_current_filter();
         self.update_status_message();
         self.state = AppState::Listing;
     }
 
-    /// User cancelled the mark, undo it
+    /// User cancelled the mark - nothing to undo since we didn't apply yet
     fn cancel_mark(&mut self) {
-        // Undo the main package
-        if let Some(pkg) = self.cache.get(&self.mark_preview.package_name) {
-            pkg.mark_keep();
-        }
-
-        // Undo all the auto-marked dependencies
-        for name in &self.mark_preview.additional_installs {
-            if let Some(pkg) = self.cache.get(name) {
-                pkg.mark_keep();
-            }
-        }
-
-        // Undo any auto-removed packages (restore them)
-        for name in &self.mark_preview.additional_removes {
-            if let Some(pkg) = self.cache.get(name) {
-                pkg.mark_keep();
-            }
-        }
-
-        // Re-resolve to ensure APT's state is consistent
-        let _ = self.cache.resolve(true);
-
         self.mark_preview = MarkPreview::default();
-        self.calculate_pending_changes();
-        self.apply_current_filter();
-        self.update_status_message();
         self.state = AppState::Listing;
     }
 
