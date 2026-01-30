@@ -3,7 +3,7 @@ use std::io;
 use std::time::Instant;
 
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -170,14 +170,27 @@ impl Column {
         }
     }
 
-    fn visible_columns() -> &'static [Column] {
-        &[
-            Self::Status,
-            Self::Name,
-            Self::InstalledVersion,
-            Self::CandidateVersion,
-            Self::DownloadSize,
-        ]
+    fn visible_columns(settings: &Settings) -> Vec<Column> {
+        let mut cols = Vec::new();
+        if settings.show_status_column {
+            cols.push(Self::Status);
+        }
+        if settings.show_name_column {
+            cols.push(Self::Name);
+        }
+        if settings.show_section_column {
+            cols.push(Self::Section);
+        }
+        if settings.show_installed_version_column {
+            cols.push(Self::InstalledVersion);
+        }
+        if settings.show_candidate_version_column {
+            cols.push(Self::CandidateVersion);
+        }
+        if settings.show_download_size_column {
+            cols.push(Self::DownloadSize);
+        }
+        cols
     }
 }
 
@@ -203,8 +216,34 @@ enum AppState {
     Searching,          // User is typing a search query
     ShowingMarkConfirm, // Popup showing additional changes when marking a package
     ShowingChanges,     // Final confirmation before applying all changes
+    ShowingChangelog,   // Viewing package changelog
+    ShowingSettings,    // Settings/preferences view
     Upgrading,
     Done,
+}
+
+/// User settings (not persisted yet)
+#[derive(Debug, Clone)]
+struct Settings {
+    show_status_column: bool,
+    show_name_column: bool,
+    show_section_column: bool,
+    show_installed_version_column: bool,
+    show_candidate_version_column: bool,
+    show_download_size_column: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            show_status_column: true,
+            show_name_column: true,
+            show_section_column: false,
+            show_installed_version_column: false,
+            show_candidate_version_column: true,
+            show_download_size_column: false,
+        }
+    }
 }
 
 /// Result of attempting to apply changes
@@ -321,10 +360,12 @@ struct App {
     search_query: String,
     search_results: Option<HashSet<String>>, // None = no active search filter
     search_build_time: Option<std::time::Duration>,
-    // Layout tracking for mouse
-    filter_area: Rect,
-    package_area: Rect,
-    details_area: Rect,
+    // Settings
+    settings: Settings,
+    settings_selection: usize,
+    // Changelog
+    changelog_content: Vec<String>,
+    changelog_scroll: u16,
 }
 
 impl App {
@@ -353,62 +394,14 @@ impl App {
             search_query: String::new(),
             search_results: None,
             search_build_time: None,
-            filter_area: Rect::default(),
-            package_area: Rect::default(),
-            details_area: Rect::default(),
+            settings: Settings::default(),
+            settings_selection: 0,
+            changelog_content: Vec::new(),
+            changelog_scroll: 0,
         };
 
         app.reload_packages()?;
         Ok(app)
-    }
-
-    fn handle_mouse_click(&mut self, x: u16, y: u16) {
-        // Determine which pane was clicked
-        if self.filter_area.contains((x, y).into()) {
-            self.focused_pane = FocusedPane::Filters;
-            // Calculate which filter was clicked (accounting for border)
-            let relative_y = y.saturating_sub(self.filter_area.y + 1);
-            let filters = FilterCategory::all();
-            if (relative_y as usize) < filters.len() {
-                self.filter_state.select(Some(relative_y as usize));
-                self.selected_filter = filters[relative_y as usize];
-                self.apply_current_filter();
-                self.table_state.select(if self.packages.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
-            }
-        } else if self.package_area.contains((x, y).into()) {
-            self.focused_pane = FocusedPane::Packages;
-            // Calculate which package was clicked (accounting for header + border)
-            let relative_y = y.saturating_sub(self.package_area.y + 2);
-            if let Some(current) = self.table_state.selected() {
-                let new_idx = current as i32 + relative_y as i32 - (self.package_area.height as i32 / 2);
-                let clamped = new_idx.clamp(0, self.packages.len().saturating_sub(1) as i32) as usize;
-                self.table_state.select(Some(clamped));
-            } else if !self.packages.is_empty() {
-                self.table_state.select(Some(relative_y as usize));
-            }
-        } else if self.details_area.contains((x, y).into()) {
-            self.focused_pane = FocusedPane::Details;
-        }
-    }
-
-    fn handle_mouse_scroll(&mut self, x: u16, y: u16, up: bool) {
-        let delta = if up { -3 } else { 3 };
-
-        if self.package_area.contains((x, y).into()) {
-            self.move_package_selection(delta);
-        } else if self.details_area.contains((x, y).into()) {
-            if up {
-                self.detail_scroll = self.detail_scroll.saturating_sub(3);
-            } else {
-                self.detail_scroll = self.detail_scroll.saturating_add(3);
-            }
-        } else if self.filter_area.contains((x, y).into()) {
-            self.move_filter_selection(delta);
-        }
     }
 
     fn ensure_search_index(&mut self) -> Result<()> {
@@ -621,12 +614,95 @@ impl App {
     }
 
     fn toggle_details_tab(&mut self) {
+        self.next_details_tab();
+    }
+
+    fn next_details_tab(&mut self) {
         self.details_tab = match self.details_tab {
             DetailsTab::Info => DetailsTab::Dependencies,
             DetailsTab::Dependencies => DetailsTab::ReverseDeps,
             DetailsTab::ReverseDeps => DetailsTab::Info,
         };
         self.detail_scroll = 0;
+    }
+
+    fn prev_details_tab(&mut self) {
+        self.details_tab = match self.details_tab {
+            DetailsTab::Info => DetailsTab::ReverseDeps,
+            DetailsTab::Dependencies => DetailsTab::Info,
+            DetailsTab::ReverseDeps => DetailsTab::Dependencies,
+        };
+        self.detail_scroll = 0;
+    }
+
+    fn show_changelog(&mut self) {
+        let pkg_name = match self.selected_package() {
+            Some(p) => p.name.clone(),
+            None => {
+                self.status_message = "No package selected".to_string();
+                return;
+            }
+        };
+
+        self.changelog_content.clear();
+        self.changelog_content.push(format!("Loading changelog for {}...", pkg_name));
+        self.changelog_scroll = 0;
+
+        // Run apt changelog command
+        match std::process::Command::new("apt")
+            .args(["changelog", &pkg_name])
+            .output()
+        {
+            Ok(output) => {
+                self.changelog_content.clear();
+                if output.status.success() {
+                    let content = String::from_utf8_lossy(&output.stdout);
+                    for line in content.lines() {
+                        self.changelog_content.push(line.to_string());
+                    }
+                    if self.changelog_content.is_empty() {
+                        self.changelog_content.push("No changelog available.".to_string());
+                    }
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    self.changelog_content.push(format!("Error: {}", err));
+                }
+            }
+            Err(e) => {
+                self.changelog_content.clear();
+                self.changelog_content.push(format!("Failed to run apt changelog: {}", e));
+            }
+        }
+
+        self.state = AppState::ShowingChangelog;
+    }
+
+    fn show_settings(&mut self) {
+        self.settings_selection = 0;
+        self.state = AppState::ShowingSettings;
+    }
+
+    fn toggle_setting(&mut self) {
+        match self.settings_selection {
+            0 => self.settings.show_status_column = !self.settings.show_status_column,
+            1 => self.settings.show_name_column = !self.settings.show_name_column,
+            2 => self.settings.show_section_column = !self.settings.show_section_column,
+            3 => self.settings.show_installed_version_column = !self.settings.show_installed_version_column,
+            4 => self.settings.show_candidate_version_column = !self.settings.show_candidate_version_column,
+            5 => self.settings.show_download_size_column = !self.settings.show_download_size_column,
+            _ => {}
+        }
+    }
+
+    fn settings_items() -> &'static [&'static str] {
+        &[
+            "Status column (S)",
+            "Name column",
+            "Section column",
+            "Installed version column",
+            "Candidate version column",
+            "Download size column",
+        ]
     }
 
     fn get_selected_reverse_dependencies(&self) -> Vec<(String, String)> {
@@ -791,6 +867,9 @@ impl App {
             }
         }
 
+        // Re-resolve to ensure APT's state is consistent
+        let _ = self.cache.resolve(true);
+
         self.mark_preview = MarkPreview::default();
         self.calculate_pending_changes();
         self.apply_current_filter();
@@ -946,6 +1025,14 @@ impl App {
         };
     }
 
+    fn cycle_focus_back(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            FocusedPane::Filters => FocusedPane::Details,
+            FocusedPane::Packages => FocusedPane::Filters,
+            FocusedPane::Details => FocusedPane::Packages,
+        };
+    }
+
     fn is_root() -> bool {
         unsafe { libc::geteuid() == 0 }
     }
@@ -1012,7 +1099,6 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
-    io::stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new()?;
@@ -1021,35 +1107,19 @@ fn main() -> Result<()> {
         terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Resize(_, _) => {
-                    // Terminal handles resize automatically on next draw
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
                 }
-                Event::Mouse(mouse) => {
-                    if app.state == AppState::Listing {
-                        match mouse.kind {
-                            MouseEventKind::Down(_) => {
-                                app.handle_mouse_click(mouse.column, mouse.row);
-                            }
-                            MouseEventKind::ScrollUp => {
-                                app.handle_mouse_scroll(mouse.column, mouse.row, true);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.handle_mouse_scroll(mouse.column, mouse.row, false);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
 
-                    match app.state {
+                match app.state {
                     AppState::Listing => match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            app.cycle_focus_back()
+                        }
                         KeyCode::Tab => app.cycle_focus(),
+                        KeyCode::BackTab => app.cycle_focus_back(),
                         KeyCode::Char('/') => app.start_search(),
                         KeyCode::Esc => {
                             // Clear search filter
@@ -1081,9 +1151,21 @@ fn main() -> Result<()> {
                                 app.toggle_current();
                             }
                         }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if app.focused_pane == FocusedPane::Details {
+                                app.prev_details_tab();
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            if app.focused_pane == FocusedPane::Details {
+                                app.next_details_tab();
+                            }
+                        }
                         KeyCode::Char('a') => app.mark_all_upgrades(),
                         KeyCode::Char('n') => app.unmark_all(),
                         KeyCode::Char('d') => app.toggle_details_tab(),
+                        KeyCode::Char('c') => app.show_changelog(),
+                        KeyCode::Char('s') => app.show_settings(),
                         KeyCode::Char('u') | KeyCode::Enter => {
                             if app.focused_pane == FocusedPane::Packages {
                                 app.show_changes_preview();
@@ -1108,7 +1190,7 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     AppState::ShowingMarkConfirm => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => {
+                        KeyCode::Char('y') | KeyCode::Char(' ') | KeyCode::Enter => {
                             app.confirm_mark();
                         }
                         KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -1155,6 +1237,43 @@ fn main() -> Result<()> {
                         }
                         _ => {}
                     },
+                    AppState::ShowingChangelog => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => {
+                            app.state = AppState::Listing;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.changelog_scroll = app.changelog_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.changelog_scroll = app.changelog_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            app.changelog_scroll = app.changelog_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            app.changelog_scroll = app.changelog_scroll.saturating_add(20);
+                        }
+                        _ => {}
+                    },
+                    AppState::ShowingSettings => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {
+                            app.state = AppState::Listing;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.settings_selection > 0 {
+                                app.settings_selection -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if app.settings_selection < App::settings_items().len() - 1 {
+                                app.settings_selection += 1;
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            app.toggle_setting();
+                        }
+                        _ => {}
+                    },
                     AppState::Upgrading => {}
                     AppState::Done => match key.code {
                         KeyCode::Char('q') => break,
@@ -1164,14 +1283,11 @@ fn main() -> Result<()> {
                         }
                         _ => {}
                     },
-                    }
                 }
-                _ => {}
             }
         }
     }
 
-    io::stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
@@ -1208,16 +1324,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(16),
+                    Constraint::Length(19),
                     Constraint::Min(40),
                     Constraint::Length(35),
                 ])
                 .split(main_chunks[1]);
-
-            // Store areas for mouse handling
-            app.filter_area = panes[0];
-            app.package_area = panes[1];
-            app.details_area = panes[2];
 
             render_filter_pane(frame, app, panes[0]);
             render_package_table(frame, app, panes[1]);
@@ -1228,15 +1339,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(16),
+                    Constraint::Length(19),
                     Constraint::Min(40),
                     Constraint::Length(35),
                 ])
                 .split(main_chunks[1]);
-
-            app.filter_area = panes[0];
-            app.package_area = panes[1];
-            app.details_area = panes[2];
 
             render_filter_pane(frame, app, panes[0]);
             render_package_table(frame, app, panes[1]);
@@ -1247,6 +1354,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
         AppState::ShowingChanges => {
             render_changes_modal(frame, app, main_chunks[1]);
+        }
+        AppState::ShowingChangelog => {
+            render_changelog_view(frame, app, main_chunks[1]);
+        }
+        AppState::ShowingSettings => {
+            render_settings_view(frame, app, main_chunks[1]);
         }
         AppState::Upgrading | AppState::Done => {
             let output_text = app.output_lines.join("\n");
@@ -1262,6 +1375,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Searching => Style::default().fg(Color::White),
         AppState::ShowingMarkConfirm => Style::default().fg(Color::Magenta),
         AppState::ShowingChanges => Style::default().fg(Color::Cyan),
+        AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
+        AppState::ShowingSettings => Style::default().fg(Color::Yellow),
         AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
     };
@@ -1288,14 +1403,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let help_text = match app.state {
         AppState::Listing => {
             if app.search_results.is_some() {
-                "/:Search │ Esc:Clear │ Space:Mark │ d:Deps │ a:All │ n:None │ u:Apply │ q:Quit"
+                "/:Search │ Esc:Clear │ Space:Mark │ d:Deps │ c:Changelog │ s:Settings │ u:Apply │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ d:Deps │ a:All │ n:None │ u:Apply │ r:Refresh │ q:Quit"
+                "/:Search │ Space:Mark │ d:Deps │ c:Changelog │ s:Settings │ u:Apply │ r:Refresh │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
-        AppState::ShowingMarkConfirm => "y/Enter:Confirm │ n/Esc:Cancel",
+        AppState::ShowingMarkConfirm => "y/Space/Enter:Confirm │ n/Esc:Cancel",
         AppState::ShowingChanges => "y/Enter:Apply │ n/Esc:Cancel │ ↑↓:Scroll",
+        AppState::ShowingChangelog => "↑↓/PgUp/PgDn:Scroll │ Esc/q:Close",
+        AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
         AppState::Upgrading => "Applying changes...",
         AppState::Done => "r:Refresh │ q:Quit",
     };
@@ -1307,6 +1424,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
 fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.focused_pane == FocusedPane::Filters;
+
+    // Split into filters and legend
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(10)])
+        .split(area);
 
     let items: Vec<ListItem> = FilterCategory::all()
         .iter()
@@ -1336,12 +1459,54 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, area, &mut app.filter_state.clone());
+    frame.render_stateful_widget(list, chunks[0], &mut app.filter_state.clone());
+
+    // Legend
+    let legend = vec![
+        Line::from(vec![
+            Span::styled("↑", Style::default().fg(Color::Yellow)),
+            Span::raw(" Upgrade"),
+        ]),
+        Line::from(vec![
+            Span::styled("+", Style::default().fg(Color::Green)),
+            Span::raw(" Install"),
+        ]),
+        Line::from(vec![
+            Span::styled("-", Style::default().fg(Color::Red)),
+            Span::raw(" Remove"),
+        ]),
+        Line::from(vec![
+            Span::styled("✓", Style::default().fg(Color::Green)),
+            Span::raw(" Installed"),
+        ]),
+        Line::from(vec![
+            Span::styled("○", Style::default().fg(Color::Gray)),
+            Span::raw(" Not inst"),
+        ]),
+        Line::from(vec![
+            Span::styled("A", Style::default().fg(Color::Green)),
+            Span::raw(" Auto-inst"),
+        ]),
+        Line::from(vec![
+            Span::styled("X", Style::default().fg(Color::Red)),
+            Span::raw(" Auto-rem"),
+        ]),
+    ];
+
+    let legend_widget = Paragraph::new(legend)
+        .block(
+            Block::default()
+                .title(" Legend ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+
+    frame.render_widget(legend_widget, chunks[1]);
 }
 
 fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.focused_pane == FocusedPane::Packages;
-    let visible_cols = Column::visible_columns();
+    let visible_cols = Column::visible_columns(&app.settings);
 
     let header_cells: Vec<Cell> = visible_cols
         .iter()
@@ -1817,4 +1982,84 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
         .scroll((app.changes_scroll, 0));
 
     frame.render_widget(modal, modal_area);
+}
+
+fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
+    let pkg_name = app
+        .selected_package()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let lines: Vec<Line> = app
+        .changelog_content
+        .iter()
+        .map(|s| Line::from(s.as_str()))
+        .collect();
+
+    let changelog = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(format!(" Changelog: {} ", pkg_name))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.changelog_scroll, 0));
+
+    frame.render_widget(changelog, area);
+}
+
+fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
+    let settings_items = App::settings_items();
+
+    let setting_values = [
+        app.settings.show_status_column,
+        app.settings.show_name_column,
+        app.settings.show_section_column,
+        app.settings.show_installed_version_column,
+        app.settings.show_candidate_version_column,
+        app.settings.show_download_size_column,
+    ];
+
+    let lines: Vec<Line> = settings_items
+        .iter()
+        .zip(setting_values.iter())
+        .enumerate()
+        .map(|(i, (name, &enabled))| {
+            let checkbox = if enabled { "[✓]" } else { "[ ]" };
+            let style = if i == app.settings_selection {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(
+                    if i == app.settings_selection { "▶ " } else { "  " },
+                    style,
+                ),
+                Span::styled(checkbox, if enabled { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
+                Span::raw(" "),
+                Span::styled(*name, style),
+            ])
+        })
+        .collect();
+
+    let mut content = vec![
+        Line::from(Span::styled(
+            "Column Visibility",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
+    ];
+    content.extend(lines);
+
+    let settings = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Settings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+
+    frame.render_widget(settings, area);
 }
