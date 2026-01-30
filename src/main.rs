@@ -21,39 +21,39 @@ use rusqlite::{Connection, params};
 /// Package status matching Synaptic's status icons
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageStatus {
-    Upgradable,   // ↑ Package can be upgraded
+    Upgradable,   // ↑ Package can be upgraded (yellow)
+    Upgrade,      // ↑ Package marked for upgrade (green)
     Install,      // + Package marked for install
     Remove,       // - Package marked for removal
     Keep,         // = Package kept at current version
-    Installed,    // ✓ Package is installed (no changes)
-    NotInstalled, // ○ Package is not installed
+    Installed,    // · Package is installed (no changes)
+    NotInstalled, //   Package is not installed
     Broken,       // ✗ Package is broken
-    AutoInstall,  // A Automatically installed (dependency)
-    AutoRemove,   // X Automatically removed
+    AutoInstall,  // + Automatically installed (dependency)
+    AutoRemove,   // - Automatically removed
 }
 
 impl PackageStatus {
     fn symbol(&self) -> &'static str {
         match self {
-            Self::Upgradable => "↑",
-            Self::Install => "+",
-            Self::Remove => "-",
+            Self::Upgradable | Self::Upgrade => "↑",
+            Self::Install | Self::AutoInstall => "+",
+            Self::Remove | Self::AutoRemove => "-",
             Self::Keep => "=",
-            Self::Installed => "✓",
-            Self::NotInstalled => "○",
+            Self::Installed => "·",
+            Self::NotInstalled => "",
             Self::Broken => "✗",
-            Self::AutoInstall => "A",
-            Self::AutoRemove => "X",
         }
     }
 
     fn color(&self) -> Color {
         match self {
             Self::Upgradable => Color::Yellow,
+            Self::Upgrade => Color::Green,
             Self::Install | Self::AutoInstall => Color::Green,
             Self::Remove | Self::AutoRemove => Color::Red,
             Self::Keep => Color::Blue,
-            Self::Installed => Color::Green,
+            Self::Installed => Color::DarkGray,
             Self::NotInstalled => Color::Gray,
             Self::Broken => Color::LightRed,
         }
@@ -366,6 +366,10 @@ struct App {
     // Changelog
     changelog_content: Vec<String>,
     changelog_scroll: u16,
+    // Cached dependencies for current selection (avoid recalc every frame)
+    cached_deps: Vec<(String, String)>,
+    cached_rdeps: Vec<(String, String)>,
+    cached_pkg_name: String,
 }
 
 impl App {
@@ -398,10 +402,59 @@ impl App {
             settings_selection: 0,
             changelog_content: Vec::new(),
             changelog_scroll: 0,
+            cached_deps: Vec::new(),
+            cached_rdeps: Vec::new(),
+            cached_pkg_name: String::new(),
         };
 
         app.reload_packages()?;
         Ok(app)
+    }
+
+    fn update_cached_deps(&mut self) {
+        let pkg_name = self
+            .selected_package()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+
+        // Only recalculate if selection changed
+        if pkg_name == self.cached_pkg_name {
+            return;
+        }
+        self.cached_pkg_name = pkg_name.clone();
+
+        // Clear and recalculate deps
+        self.cached_deps.clear();
+        self.cached_rdeps.clear();
+
+        let pkg = match self.cache.get(&pkg_name) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Get forward dependencies
+        if let Some(version) = pkg.candidate() {
+            if let Some(dependencies) = version.dependencies() {
+                for dep in dependencies {
+                    let dep_type = dep.dep_type().to_string();
+                    for base_dep in dep.iter() {
+                        self.cached_deps.push((dep_type.clone(), base_dep.name().to_string()));
+                    }
+                }
+            }
+        }
+
+        // Get reverse dependencies
+        let rdep_map = pkg.rdepends();
+        for (dep_type, deps) in rdep_map.iter() {
+            let type_str = format!("{:?}", dep_type);
+            for dep in deps {
+                for base_dep in dep.iter() {
+                    self.cached_rdeps.push((type_str.clone(), base_dep.name().to_string()));
+                }
+            }
+        }
+        self.cached_rdeps.sort();
     }
 
     fn ensure_search_index(&mut self) -> Result<()> {
@@ -522,8 +575,14 @@ impl App {
     fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
         let candidate = pkg.candidate()?;
 
-        let status = if pkg.marked_install() {
-            if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
+        let status = if pkg.marked_upgrade() {
+            // Upgrade is always for installed packages
+            PackageStatus::Upgrade
+        } else if pkg.marked_install() {
+            if pkg.is_installed() {
+                // Installed package marked for install = upgrade
+                PackageStatus::Upgrade
+            } else if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
                 PackageStatus::Install
             } else {
                 PackageStatus::AutoInstall
@@ -534,8 +593,6 @@ impl App {
             } else {
                 PackageStatus::AutoRemove
             }
-        } else if pkg.marked_upgrade() {
-            PackageStatus::Upgradable
         } else if pkg.is_installed() {
             if pkg.is_upgradable() {
                 PackageStatus::Upgradable
@@ -576,41 +633,6 @@ impl App {
         self.table_state
             .selected()
             .and_then(|i| self.packages.get(i))
-    }
-
-    fn get_selected_dependencies(&self) -> Vec<(String, String)> {
-        // Returns: Vec<(dep_type, target_name)>
-        let mut deps = Vec::new();
-
-        let pkg_name = match self.selected_package() {
-            Some(p) => p.name.clone(),
-            None => return deps,
-        };
-
-        let pkg = match self.cache.get(&pkg_name) {
-            Some(p) => p,
-            None => return deps,
-        };
-
-        let version = match pkg.candidate() {
-            Some(v) => v,
-            None => return deps,
-        };
-
-        // Get dependencies from the candidate version
-        if let Some(dependencies) = version.dependencies() {
-            for dep in dependencies {
-                let dep_type = dep.dep_type().to_string();
-
-                // Dependency derefs to Vec<BaseDep>, iterate through them
-                for base_dep in dep.iter() {
-                    let target = base_dep.name().to_string();
-                    deps.push((dep_type.clone(), target));
-                }
-            }
-        }
-
-        deps
     }
 
     fn toggle_details_tab(&mut self) {
@@ -703,35 +725,6 @@ impl App {
             "Candidate version column",
             "Download size column",
         ]
-    }
-
-    fn get_selected_reverse_dependencies(&self) -> Vec<(String, String)> {
-        // Returns: Vec<(dep_type, package_that_depends_on_us)>
-        let mut rdeps = Vec::new();
-
-        let pkg_name = match self.selected_package() {
-            Some(p) => p.name.clone(),
-            None => return rdeps,
-        };
-
-        let pkg = match self.cache.get(&pkg_name) {
-            Some(p) => p,
-            None => return rdeps,
-        };
-
-        // Get reverse dependencies
-        let rdep_map = pkg.rdepends();
-
-        for (dep_type, deps) in rdep_map.iter() {
-            let type_str = format!("{:?}", dep_type);
-            for dep in deps {
-                for base_dep in dep.iter() {
-                    rdeps.push((type_str.clone(), base_dep.name().to_string()));
-                }
-            }
-        }
-
-        rdeps
     }
 
     fn toggle_current(&mut self) {
@@ -1428,7 +1421,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     // Split into filters and legend
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(10)])
+        .constraints([Constraint::Min(7), Constraint::Length(6)])
         .split(area);
 
     let items: Vec<ListItem> = FilterCategory::all()
@@ -1465,7 +1458,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let legend = vec![
         Line::from(vec![
             Span::styled("↑", Style::default().fg(Color::Yellow)),
-            Span::raw(" Upgrade"),
+            Span::raw(" Upg avail"),
         ]),
         Line::from(vec![
             Span::styled("+", Style::default().fg(Color::Green)),
@@ -1476,20 +1469,8 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" Remove"),
         ]),
         Line::from(vec![
-            Span::styled("✓", Style::default().fg(Color::Green)),
+            Span::styled("·", Style::default().fg(Color::DarkGray)),
             Span::raw(" Installed"),
-        ]),
-        Line::from(vec![
-            Span::styled("○", Style::default().fg(Color::Gray)),
-            Span::raw(" Not inst"),
-        ]),
-        Line::from(vec![
-            Span::styled("A", Style::default().fg(Color::Green)),
-            Span::raw(" Auto-inst"),
-        ]),
-        Line::from(vec![
-            Span::styled("X", Style::default().fg(Color::Red)),
-            Span::raw(" Auto-rem"),
         ]),
     ];
 
@@ -1589,6 +1570,9 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Update cached deps if selection changed
+    app.update_cached_deps();
+
     let is_focused = app.focused_pane == FocusedPane::Details;
 
     let border_style = if is_focused {
@@ -1679,9 +1663,7 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                 ]);
             }
             DetailsTab::Dependencies => {
-                let deps = app.get_selected_dependencies();
-
-                if deps.is_empty() {
+                if app.cached_deps.is_empty() {
                     content.push(Line::from(Span::styled(
                         "No dependencies",
                         Style::default().fg(Color::DarkGray),
@@ -1690,8 +1672,8 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                     // Group by dep type
                     let mut current_type = String::new();
 
-                    for (dep_type, target) in deps {
-                        if dep_type != current_type {
+                    for (dep_type, target) in &app.cached_deps {
+                        if dep_type != &current_type {
                             if !current_type.is_empty() {
                                 content.push(Line::from(""));
                             }
@@ -1699,11 +1681,11 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                                 format!("{}:", dep_type),
                                 Style::default().fg(Color::Cyan).bold(),
                             )));
-                            current_type = dep_type;
+                            current_type = dep_type.clone();
                         }
 
                         // Check if target is installed
-                        let is_installed = app.cache.get(&target)
+                        let is_installed = app.cache.get(target)
                             .map(|p| p.is_installed())
                             .unwrap_or(false);
 
@@ -1718,22 +1700,20 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                             Span::raw("  "),
                             Span::styled(symbol, style),
                             Span::raw(" "),
-                            Span::styled(target, style),
+                            Span::styled(target.clone(), style),
                         ]));
                     }
                 }
             }
             DetailsTab::ReverseDeps => {
-                let rdeps = app.get_selected_reverse_dependencies();
-
-                if rdeps.is_empty() {
+                if app.cached_rdeps.is_empty() {
                     content.push(Line::from(Span::styled(
                         "No reverse dependencies",
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
                     content.push(Line::from(Span::styled(
-                        format!("{} packages depend on this:", rdeps.len()),
+                        format!("{} packages depend on this:", app.cached_rdeps.len()),
                         Style::default().fg(Color::Cyan).bold(),
                     )));
                     content.push(Line::from(""));
@@ -1741,8 +1721,8 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                     // Group by dep type
                     let mut current_type = String::new();
 
-                    for (dep_type, pkg_name) in rdeps {
-                        if dep_type != current_type {
+                    for (dep_type, pkg_name) in &app.cached_rdeps {
+                        if dep_type != &current_type {
                             if !current_type.is_empty() {
                                 content.push(Line::from(""));
                             }
@@ -1750,11 +1730,11 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                                 format!("{}:", dep_type),
                                 Style::default().fg(Color::Cyan).bold(),
                             )));
-                            current_type = dep_type;
+                            current_type = dep_type.clone();
                         }
 
                         // Check if the depending package is installed
-                        let is_installed = app.cache.get(&pkg_name)
+                        let is_installed = app.cache.get(pkg_name)
                             .map(|p| p.is_installed())
                             .unwrap_or(false);
 
@@ -1769,7 +1749,7 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                             Span::raw("  "),
                             Span::styled(symbol, style),
                             Span::raw(" "),
-                            Span::styled(pkg_name, style),
+                            Span::styled(pkg_name.clone(), style),
                         ]));
                     }
                 }
