@@ -159,13 +159,13 @@ impl Column {
         }
     }
 
-    fn width(&self) -> Constraint {
+    fn width(&self, app: &App) -> Constraint {
         match self {
             Self::Status => Constraint::Length(3),
-            Self::Name => Constraint::Min(20),
-            Self::Section => Constraint::Length(12),
-            Self::InstalledVersion => Constraint::Length(16),
-            Self::CandidateVersion => Constraint::Length(16),
+            Self::Name => Constraint::Min(app.col_width_name),
+            Self::Section => Constraint::Length(app.col_width_section),
+            Self::InstalledVersion => Constraint::Length(app.col_width_installed),
+            Self::CandidateVersion => Constraint::Length(app.col_width_candidate),
             Self::DownloadSize => Constraint::Length(10),
         }
     }
@@ -370,6 +370,11 @@ struct App {
     cached_deps: Vec<(String, String)>,
     cached_rdeps: Vec<(String, String)>,
     cached_pkg_name: String,
+    // Column widths (calculated from content)
+    col_width_name: u16,
+    col_width_section: u16,
+    col_width_installed: u16,
+    col_width_candidate: u16,
 }
 
 impl App {
@@ -405,6 +410,10 @@ impl App {
             cached_deps: Vec::new(),
             cached_rdeps: Vec::new(),
             cached_pkg_name: String::new(),
+            col_width_name: 10,
+            col_width_section: 7,
+            col_width_installed: 9,
+            col_width_candidate: 9,
         };
 
         app.reload_packages()?;
@@ -538,6 +547,12 @@ impl App {
     fn apply_current_filter(&mut self) {
         self.packages.clear();
 
+        // Reset column widths to header minimums
+        self.col_width_name = 7;      // "Package"
+        self.col_width_section = 7;   // "Section"
+        self.col_width_installed = 9; // "Installed"
+        self.col_width_candidate = 9; // "Candidate"
+
         let sort = if self.selected_filter == FilterCategory::Upgradable {
             PackageSort::default().upgradable()
         } else {
@@ -564,6 +579,11 @@ impl App {
 
             if matches_category && matches_search {
                 if let Some(info) = self.extract_package_info(&pkg) {
+                    // Track max column widths
+                    self.col_width_name = self.col_width_name.max(info.name.len() as u16);
+                    self.col_width_section = self.col_width_section.max(info.section.len() as u16);
+                    self.col_width_installed = self.col_width_installed.max(info.installed_version.len() as u16);
+                    self.col_width_candidate = self.col_width_candidate.max(info.candidate_version.len() as u16);
                     self.packages.push(info);
                 }
             }
@@ -1421,7 +1441,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     // Split into filters and legend
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(6)])
+        .constraints([Constraint::Min(7), Constraint::Length(7)])
         .split(area);
 
     let items: Vec<ListItem> = FilterCategory::all()
@@ -1459,6 +1479,10 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("↑", Style::default().fg(Color::Yellow)),
             Span::raw(" Upg avail"),
+        ]),
+        Line::from(vec![
+            Span::styled("↑", Style::default().fg(Color::Green)),
+            Span::raw(" Upgrading"),
         ]),
         Line::from(vec![
             Span::styled("+", Style::default().fg(Color::Green)),
@@ -1530,7 +1554,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width()).collect();
+    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width(app)).collect();
 
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
