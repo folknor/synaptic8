@@ -222,6 +222,30 @@ enum AppState {
     Done,
 }
 
+/// Sort options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    Name,
+    Section,
+    InstalledVersion,
+    CandidateVersion,
+}
+
+impl SortBy {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Section => "Section",
+            Self::InstalledVersion => "Installed version",
+            Self::CandidateVersion => "Candidate version",
+        }
+    }
+
+    fn all() -> &'static [SortBy] {
+        &[Self::Name, Self::Section, Self::InstalledVersion, Self::CandidateVersion]
+    }
+}
+
 /// User settings (not persisted yet)
 #[derive(Debug, Clone)]
 struct Settings {
@@ -231,6 +255,8 @@ struct Settings {
     show_installed_version_column: bool,
     show_candidate_version_column: bool,
     show_download_size_column: bool,
+    sort_by: SortBy,
+    sort_ascending: bool,
 }
 
 impl Default for Settings {
@@ -242,6 +268,8 @@ impl Default for Settings {
             show_installed_version_column: false,
             show_candidate_version_column: true,
             show_download_size_column: false,
+            sort_by: SortBy::CandidateVersion,
+            sort_ascending: true,
         }
     }
 }
@@ -453,6 +481,22 @@ impl App {
             }
         }
 
+        // Sort deps by type priority, then by name
+        fn dep_type_order(t: &str) -> u8 {
+            match t {
+                "PreDepends" => 0,
+                "Depends" => 1,
+                "Recommends" => 2,
+                "Suggests" => 3,
+                "Enhances" => 4,
+                _ => 5,
+            }
+        }
+        self.cached_deps.sort_by(|a, b| {
+            dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
         // Get reverse dependencies
         let rdep_map = pkg.rdepends();
         for (dep_type, deps) in rdep_map.iter() {
@@ -463,7 +507,45 @@ impl App {
                 }
             }
         }
-        self.cached_rdeps.sort();
+        // Sort rdeps by type priority, then by name
+        self.cached_rdeps.sort_by(|a, b| {
+            dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+    }
+
+    /// Get status for a package by name (for dep views)
+    fn get_package_status(&self, name: &str) -> PackageStatus {
+        match self.cache.get(name) {
+            Some(pkg) => {
+                if pkg.marked_upgrade() {
+                    PackageStatus::Upgrade
+                } else if pkg.marked_install() {
+                    if pkg.is_installed() {
+                        PackageStatus::Upgrade
+                    } else if self.user_marked.get(name).copied().unwrap_or(false) {
+                        PackageStatus::Install
+                    } else {
+                        PackageStatus::AutoInstall
+                    }
+                } else if pkg.marked_delete() {
+                    if self.user_marked.get(name).copied().unwrap_or(false) {
+                        PackageStatus::Remove
+                    } else {
+                        PackageStatus::AutoRemove
+                    }
+                } else if pkg.is_installed() {
+                    if pkg.is_upgradable() {
+                        PackageStatus::Upgradable
+                    } else {
+                        PackageStatus::Installed
+                    }
+                } else {
+                    PackageStatus::NotInstalled
+                }
+            }
+            None => PackageStatus::NotInstalled,
+        }
     }
 
     fn ensure_search_index(&mut self) -> Result<()> {
@@ -589,7 +671,17 @@ impl App {
             }
         }
 
-        self.packages.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sort packages
+        let cmp = |a: &PackageInfo, b: &PackageInfo| {
+            let ord = match self.settings.sort_by {
+                SortBy::Name => a.name.cmp(&b.name),
+                SortBy::Section => a.section.cmp(&b.section),
+                SortBy::InstalledVersion => a.installed_version.cmp(&b.installed_version),
+                SortBy::CandidateVersion => a.candidate_version.cmp(&b.candidate_version),
+            };
+            if self.settings.sort_ascending { ord } else { ord.reverse() }
+        };
+        self.packages.sort_by(cmp);
     }
 
     fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
@@ -732,19 +824,23 @@ impl App {
             3 => self.settings.show_installed_version_column = !self.settings.show_installed_version_column,
             4 => self.settings.show_candidate_version_column = !self.settings.show_candidate_version_column,
             5 => self.settings.show_download_size_column = !self.settings.show_download_size_column,
+            // Sort options - cycle through
+            6 => {
+                let all = SortBy::all();
+                let idx = all.iter().position(|&s| s == self.settings.sort_by).unwrap_or(0);
+                self.settings.sort_by = all[(idx + 1) % all.len()];
+                self.apply_current_filter();
+            }
+            7 => {
+                self.settings.sort_ascending = !self.settings.sort_ascending;
+                self.apply_current_filter();
+            }
             _ => {}
         }
     }
 
-    fn settings_items() -> &'static [&'static str] {
-        &[
-            "Status column (S)",
-            "Name column",
-            "Section column",
-            "Installed version column",
-            "Candidate version column",
-            "Download size column",
-        ]
+    fn settings_item_count() -> usize {
+        8 // 6 column toggles + 2 sort options
     }
 
     fn toggle_current(&mut self) {
@@ -1196,6 +1292,9 @@ fn main() -> Result<()> {
                             app.search_query.pop();
                             app.execute_search();
                         }
+                        KeyCode::Up => app.move_package_selection(-1),
+                        KeyCode::Down => app.move_package_selection(1),
+                        KeyCode::Char(' ') => app.toggle_current(),
                         KeyCode::Char(c) => {
                             app.search_query.push(c);
                             app.execute_search();
@@ -1278,7 +1377,7 @@ fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            if app.settings_selection < App::settings_items().len() - 1 {
+                            if app.settings_selection < App::settings_item_count() - 1 {
                                 app.settings_selection += 1;
                             }
                         }
@@ -1708,23 +1807,15 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                             current_type = dep_type.clone();
                         }
 
-                        // Check if target is installed
-                        let is_installed = app.cache.get(target)
-                            .map(|p| p.is_installed())
-                            .unwrap_or(false);
+                        let status = app.get_package_status(target);
+                        let symbol = status.symbol();
+                        let color = status.color();
 
-                        let style = if is_installed {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::Yellow)
-                        };
-
-                        let symbol = if is_installed { "✓" } else { "○" };
                         content.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(symbol, style),
+                            Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
                             Span::raw(" "),
-                            Span::styled(target.clone(), style),
+                            Span::raw(target.clone()),
                         ]));
                     }
                 }
@@ -1757,23 +1848,15 @@ fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
                             current_type = dep_type.clone();
                         }
 
-                        // Check if the depending package is installed
-                        let is_installed = app.cache.get(pkg_name)
-                            .map(|p| p.is_installed())
-                            .unwrap_or(false);
+                        let status = app.get_package_status(pkg_name);
+                        let symbol = status.symbol();
+                        let color = status.color();
 
-                        let style = if is_installed {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
-
-                        let symbol = if is_installed { "✓" } else { "○" };
                         content.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(symbol, style),
+                            Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
                             Span::raw(" "),
-                            Span::styled(pkg_name.clone(), style),
+                            Span::raw(pkg_name.clone()),
                         ]));
                     }
                 }
@@ -2014,39 +2097,14 @@ fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
-    let settings_items = App::settings_items();
-
-    let setting_values = [
-        app.settings.show_status_column,
-        app.settings.show_name_column,
-        app.settings.show_section_column,
-        app.settings.show_installed_version_column,
-        app.settings.show_candidate_version_column,
-        app.settings.show_download_size_column,
+    let column_items = [
+        ("Status column (S)", app.settings.show_status_column),
+        ("Name column", app.settings.show_name_column),
+        ("Section column", app.settings.show_section_column),
+        ("Installed version column", app.settings.show_installed_version_column),
+        ("Candidate version column", app.settings.show_candidate_version_column),
+        ("Download size column", app.settings.show_download_size_column),
     ];
-
-    let lines: Vec<Line> = settings_items
-        .iter()
-        .zip(setting_values.iter())
-        .enumerate()
-        .map(|(i, (name, &enabled))| {
-            let checkbox = if enabled { "[✓]" } else { "[ ]" };
-            let style = if i == app.settings_selection {
-                Style::default().fg(Color::Yellow).bold()
-            } else {
-                Style::default()
-            };
-            Line::from(vec![
-                Span::styled(
-                    if i == app.settings_selection { "▶ " } else { "  " },
-                    style,
-                ),
-                Span::styled(checkbox, if enabled { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
-                Span::raw(" "),
-                Span::styled(*name, style),
-            ])
-        })
-        .collect();
 
     let mut content = vec![
         Line::from(Span::styled(
@@ -2055,7 +2113,67 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
         Line::from(""),
     ];
-    content.extend(lines);
+
+    // Column toggles (items 0-5)
+    for (i, (name, enabled)) in column_items.iter().enumerate() {
+        let checkbox = if *enabled { "[✓]" } else { "[ ]" };
+        let style = if i == app.settings_selection {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default()
+        };
+        content.push(Line::from(vec![
+            Span::styled(
+                if i == app.settings_selection { "▶ " } else { "  " },
+                style,
+            ),
+            Span::styled(checkbox, if *enabled { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
+            Span::raw(" "),
+            Span::styled(*name, style),
+        ]));
+    }
+
+    // Sort section
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        "Sorting",
+        Style::default().fg(Color::Cyan).bold(),
+    )));
+    content.push(Line::from(""));
+
+    // Sort by (item 6)
+    let sort_style = if app.settings_selection == 6 {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default()
+    };
+    content.push(Line::from(vec![
+        Span::styled(
+            if app.settings_selection == 6 { "▶ " } else { "  " },
+            sort_style,
+        ),
+        Span::styled("Sort by: ", sort_style),
+        Span::styled(
+            app.settings.sort_by.label(),
+            Style::default().fg(Color::Green),
+        ),
+    ]));
+
+    // Sort direction (item 7)
+    let dir_style = if app.settings_selection == 7 {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default()
+    };
+    let dir_label = if app.settings.sort_ascending { "Ascending" } else { "Descending" };
+    content.push(Line::from(vec![
+        Span::styled(
+            if app.settings_selection == 7 { "▶ " } else { "  " },
+            dir_style,
+        ),
+        Span::styled("Direction: ", dir_style),
+        Span::styled(dir_label, Style::default().fg(Color::Green)),
+    ]));
 
     let settings = Paragraph::new(content)
         .block(
