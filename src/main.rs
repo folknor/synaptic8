@@ -1,0 +1,1730 @@
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::time::Instant;
+
+use color_eyre::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+use ratatui::prelude::*;
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+};
+use rust_apt::cache::{Cache, PackageSort};
+use rust_apt::progress::{AcquireProgress, InstallProgress};
+use rust_apt::{Package, Version};
+use rusqlite::{Connection, params};
+
+/// Package status matching Synaptic's status icons
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageStatus {
+    Upgradable,   // ↑ Package can be upgraded
+    Install,      // + Package marked for install
+    Remove,       // - Package marked for removal
+    Keep,         // = Package kept at current version
+    Installed,    // ✓ Package is installed (no changes)
+    NotInstalled, // ○ Package is not installed
+    Broken,       // ✗ Package is broken
+    AutoInstall,  // A Automatically installed (dependency)
+    AutoRemove,   // X Automatically removed
+}
+
+impl PackageStatus {
+    fn symbol(&self) -> &'static str {
+        match self {
+            Self::Upgradable => "↑",
+            Self::Install => "+",
+            Self::Remove => "-",
+            Self::Keep => "=",
+            Self::Installed => "✓",
+            Self::NotInstalled => "○",
+            Self::Broken => "✗",
+            Self::AutoInstall => "A",
+            Self::AutoRemove => "X",
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            Self::Upgradable => Color::Yellow,
+            Self::Install | Self::AutoInstall => Color::Green,
+            Self::Remove | Self::AutoRemove => Color::Red,
+            Self::Keep => Color::Blue,
+            Self::Installed => Color::Green,
+            Self::NotInstalled => Color::Gray,
+            Self::Broken => Color::LightRed,
+        }
+    }
+}
+
+/// Filter categories (left panel)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterCategory {
+    Upgradable,
+    MarkedChanges,
+    Installed,
+    NotInstalled,
+    All,
+}
+
+impl FilterCategory {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Upgradable => "Upgradable",
+            Self::MarkedChanges => "Marked Changes",
+            Self::Installed => "Installed",
+            Self::NotInstalled => "Not Installed",
+            Self::All => "All Packages",
+        }
+    }
+
+    fn all() -> &'static [FilterCategory] {
+        &[
+            Self::Upgradable,
+            Self::MarkedChanges,
+            Self::Installed,
+            Self::NotInstalled,
+            Self::All,
+        ]
+    }
+}
+
+/// Displayed package info (extracted from rust-apt Package)
+#[derive(Debug, Clone)]
+struct PackageInfo {
+    name: String,
+    status: PackageStatus,
+    section: String,
+    installed_version: String,
+    candidate_version: String,
+    installed_size: u64,
+    download_size: u64,
+    description: String,
+    architecture: String,
+    is_user_marked: bool,
+}
+
+impl PackageInfo {
+    fn size_str(bytes: u64) -> String {
+        if bytes == 0 {
+            return String::from("-");
+        }
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+
+        if bytes >= GB {
+            format!("{:.1} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.1} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.1} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn installed_size_str(&self) -> String {
+        Self::size_str(self.installed_size)
+    }
+
+    fn download_size_str(&self) -> String {
+        Self::size_str(self.download_size)
+    }
+}
+
+/// Column configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Column {
+    Status,
+    Name,
+    Section,
+    InstalledVersion,
+    CandidateVersion,
+    DownloadSize,
+}
+
+impl Column {
+    fn header(&self) -> &'static str {
+        match self {
+            Self::Status => "S",
+            Self::Name => "Package",
+            Self::Section => "Section",
+            Self::InstalledVersion => "Installed",
+            Self::CandidateVersion => "Candidate",
+            Self::DownloadSize => "Download",
+        }
+    }
+
+    fn width(&self) -> Constraint {
+        match self {
+            Self::Status => Constraint::Length(3),
+            Self::Name => Constraint::Min(20),
+            Self::Section => Constraint::Length(12),
+            Self::InstalledVersion => Constraint::Length(16),
+            Self::CandidateVersion => Constraint::Length(16),
+            Self::DownloadSize => Constraint::Length(10),
+        }
+    }
+
+    fn visible_columns() -> &'static [Column] {
+        &[
+            Self::Status,
+            Self::Name,
+            Self::InstalledVersion,
+            Self::CandidateVersion,
+            Self::DownloadSize,
+        ]
+    }
+}
+
+/// Which pane has focus
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedPane {
+    Filters,
+    Packages,
+    Details,
+}
+
+/// Which tab is shown in details pane
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailsTab {
+    Info,
+    Dependencies,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AppState {
+    Listing,
+    Searching,          // User is typing a search query
+    ShowingMarkConfirm, // Popup showing additional changes when marking a package
+    ShowingChanges,     // Final confirmation before applying all changes
+    Upgrading,
+    Done,
+}
+
+/// Result of attempting to apply changes
+enum ApplyResult {
+    NotRoot,
+    NeedsCommit,
+}
+
+/// Additional changes required when marking a single package
+#[derive(Debug, Default, Clone)]
+struct MarkPreview {
+    package_name: String,
+    is_marking: bool, // true = marking for install, false = unmarking
+    additional_installs: Vec<String>,
+    additional_removes: Vec<String>,
+    download_size: u64,
+}
+
+/// Changes to be applied
+#[derive(Debug, Default)]
+struct PendingChanges {
+    to_install: Vec<String>,
+    to_upgrade: Vec<String>,
+    to_remove: Vec<String>,
+    auto_install: Vec<String>,
+    auto_remove: Vec<String>,
+    download_size: u64,
+    install_size_change: i64,
+}
+
+/// SQLite FTS5 search index
+struct SearchIndex {
+    conn: Connection,
+}
+
+impl SearchIndex {
+    fn new() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS packages USING fts5(name, description)",
+            [],
+        )?;
+        Ok(Self { conn })
+    }
+
+    fn build(&mut self, cache: &Cache) -> Result<(usize, std::time::Duration)> {
+        let start = Instant::now();
+        let mut count = 0;
+
+        // Clear existing data
+        self.conn.execute("DELETE FROM packages", [])?;
+
+        // Insert all packages
+        let mut stmt = self.conn.prepare("INSERT INTO packages (name, description) VALUES (?, ?)")?;
+
+        for pkg in cache.packages(&PackageSort::default()) {
+            let name = pkg.name();
+            let desc = pkg.candidate()
+                .and_then(|c| c.summary())
+                .unwrap_or_default();
+            stmt.execute(params![name, desc])?;
+            count += 1;
+        }
+
+        Ok((count, start.elapsed()))
+    }
+
+    fn search(&self, query: &str) -> Result<HashSet<String>> {
+        let mut results = HashSet::new();
+
+        if query.is_empty() {
+            return Ok(results);
+        }
+
+        // Escape special FTS5 characters and add prefix matching
+        let fts_query = query
+            .split_whitespace()
+            .map(|word| format!("{}*", word.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT name FROM packages WHERE packages MATCH ?"
+        )?;
+
+        let rows = stmt.query_map([&fts_query], |row| row.get::<_, String>(0))?;
+
+        for name in rows.flatten() {
+            results.insert(name);
+        }
+
+        Ok(results)
+    }
+}
+
+struct App {
+    cache: Cache,
+    packages: Vec<PackageInfo>,
+    user_marked: HashMap<String, bool>,
+    table_state: TableState,
+    filter_state: ListState,
+    state: AppState,
+    status_message: String,
+    output_lines: Vec<String>,
+    focused_pane: FocusedPane,
+    selected_filter: FilterCategory,
+    detail_scroll: u16,
+    details_tab: DetailsTab,
+    pending_changes: PendingChanges,
+    changes_scroll: u16,
+    mark_preview: MarkPreview, // Preview of additional changes when marking
+    // Search
+    search_index: Option<SearchIndex>,
+    search_query: String,
+    search_results: Option<HashSet<String>>, // None = no active search filter
+    search_build_time: Option<std::time::Duration>,
+    // Layout tracking for mouse
+    filter_area: Rect,
+    package_area: Rect,
+    details_area: Rect,
+}
+
+impl App {
+    fn new() -> Result<Self> {
+        let cache = Cache::new::<&str>(&[])?;
+        let mut filter_state = ListState::default();
+        filter_state.select(Some(0));
+
+        let mut app = Self {
+            cache,
+            packages: Vec::new(),
+            user_marked: HashMap::new(),
+            table_state: TableState::default(),
+            filter_state,
+            state: AppState::Listing,
+            status_message: String::from("Loading..."),
+            output_lines: Vec::new(),
+            focused_pane: FocusedPane::Packages,
+            selected_filter: FilterCategory::Upgradable,
+            detail_scroll: 0,
+            details_tab: DetailsTab::Info,
+            pending_changes: PendingChanges::default(),
+            changes_scroll: 0,
+            mark_preview: MarkPreview::default(),
+            search_index: None,
+            search_query: String::new(),
+            search_results: None,
+            search_build_time: None,
+            filter_area: Rect::default(),
+            package_area: Rect::default(),
+            details_area: Rect::default(),
+        };
+
+        app.reload_packages()?;
+        Ok(app)
+    }
+
+    fn handle_mouse_click(&mut self, x: u16, y: u16) {
+        // Determine which pane was clicked
+        if self.filter_area.contains((x, y).into()) {
+            self.focused_pane = FocusedPane::Filters;
+            // Calculate which filter was clicked (accounting for border)
+            let relative_y = y.saturating_sub(self.filter_area.y + 1);
+            let filters = FilterCategory::all();
+            if (relative_y as usize) < filters.len() {
+                self.filter_state.select(Some(relative_y as usize));
+                self.selected_filter = filters[relative_y as usize];
+                self.apply_current_filter();
+                self.table_state.select(if self.packages.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+            }
+        } else if self.package_area.contains((x, y).into()) {
+            self.focused_pane = FocusedPane::Packages;
+            // Calculate which package was clicked (accounting for header + border)
+            let relative_y = y.saturating_sub(self.package_area.y + 2);
+            if let Some(current) = self.table_state.selected() {
+                let new_idx = current as i32 + relative_y as i32 - (self.package_area.height as i32 / 2);
+                let clamped = new_idx.clamp(0, self.packages.len().saturating_sub(1) as i32) as usize;
+                self.table_state.select(Some(clamped));
+            } else if !self.packages.is_empty() {
+                self.table_state.select(Some(relative_y as usize));
+            }
+        } else if self.details_area.contains((x, y).into()) {
+            self.focused_pane = FocusedPane::Details;
+        }
+    }
+
+    fn handle_mouse_scroll(&mut self, x: u16, y: u16, up: bool) {
+        let delta = if up { -3 } else { 3 };
+
+        if self.package_area.contains((x, y).into()) {
+            self.move_package_selection(delta);
+        } else if self.details_area.contains((x, y).into()) {
+            if up {
+                self.detail_scroll = self.detail_scroll.saturating_sub(3);
+            } else {
+                self.detail_scroll = self.detail_scroll.saturating_add(3);
+            }
+        } else if self.filter_area.contains((x, y).into()) {
+            self.move_filter_selection(delta);
+        }
+    }
+
+    fn ensure_search_index(&mut self) -> Result<()> {
+        if self.search_index.is_none() {
+            let mut index = SearchIndex::new()?;
+            let (count, duration) = index.build(&self.cache)?;
+            self.search_build_time = Some(duration);
+            self.status_message = format!(
+                "Search index built: {} packages in {:.0}ms",
+                count,
+                duration.as_secs_f64() * 1000.0
+            );
+            self.search_index = Some(index);
+        }
+        Ok(())
+    }
+
+    fn start_search(&mut self) {
+        if let Err(e) = self.ensure_search_index() {
+            self.status_message = format!("Failed to build search index: {}", e);
+            return;
+        }
+        self.search_query.clear();
+        self.state = AppState::Searching;
+    }
+
+    fn execute_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_results = None;
+        } else if let Some(ref index) = self.search_index {
+            match index.search(&self.search_query) {
+                Ok(results) => {
+                    self.search_results = Some(results);
+                }
+                Err(e) => {
+                    self.status_message = format!("Search error: {}", e);
+                    self.search_results = None;
+                }
+            }
+        }
+        self.apply_current_filter();
+        self.table_state.select(if self.packages.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_query.clear();
+        self.search_results = None;
+        self.state = AppState::Listing;
+        self.apply_current_filter();
+        self.update_status_message();
+    }
+
+    fn confirm_search(&mut self) {
+        self.execute_search();
+        self.state = AppState::Listing;
+        if let Some(ref results) = self.search_results {
+            self.status_message = format!(
+                "Found {} packages matching '{}'",
+                results.len(),
+                self.search_query
+            );
+        }
+    }
+
+    fn reload_packages(&mut self) -> Result<()> {
+        self.packages.clear();
+        self.apply_current_filter();
+
+        if !self.packages.is_empty() {
+            self.table_state.select(Some(0));
+        }
+
+        self.update_status_message();
+        Ok(())
+    }
+
+    fn apply_current_filter(&mut self) {
+        self.packages.clear();
+
+        let sort = if self.selected_filter == FilterCategory::Upgradable {
+            PackageSort::default().upgradable()
+        } else {
+            PackageSort::default()
+        };
+
+        for pkg in self.cache.packages(&sort) {
+            // Apply category filter
+            let matches_category = match self.selected_filter {
+                FilterCategory::Upgradable => pkg.is_upgradable(),
+                FilterCategory::MarkedChanges => {
+                    pkg.marked_install() || pkg.marked_delete() || pkg.marked_upgrade()
+                }
+                FilterCategory::Installed => pkg.is_installed(),
+                FilterCategory::NotInstalled => !pkg.is_installed(),
+                FilterCategory::All => true,
+            };
+
+            // Apply search filter if active
+            let matches_search = match &self.search_results {
+                Some(results) => results.contains(pkg.name()),
+                None => true,
+            };
+
+            if matches_category && matches_search {
+                if let Some(info) = self.extract_package_info(&pkg) {
+                    self.packages.push(info);
+                }
+            }
+        }
+
+        self.packages.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
+        let candidate = pkg.candidate()?;
+
+        let status = if pkg.marked_install() {
+            if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
+                PackageStatus::Install
+            } else {
+                PackageStatus::AutoInstall
+            }
+        } else if pkg.marked_delete() {
+            if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
+                PackageStatus::Remove
+            } else {
+                PackageStatus::AutoRemove
+            }
+        } else if pkg.marked_upgrade() {
+            PackageStatus::Upgradable
+        } else if pkg.is_installed() {
+            if pkg.is_upgradable() {
+                PackageStatus::Upgradable
+            } else {
+                PackageStatus::Installed
+            }
+        } else {
+            PackageStatus::NotInstalled
+        };
+
+        let installed_version = pkg
+            .installed()
+            .map(|v: Version| v.version().to_string())
+            .unwrap_or_default();
+
+        let installed_size = candidate.installed_size();
+        let download_size = candidate.size();
+
+        let description = candidate.summary().unwrap_or_default().to_string();
+        let section = candidate.section().unwrap_or("unknown").to_string();
+        let architecture = candidate.arch().to_string();
+
+        Some(PackageInfo {
+            name: pkg.name().to_string(),
+            status,
+            section,
+            installed_version,
+            candidate_version: candidate.version().to_string(),
+            installed_size,
+            download_size,
+            description,
+            architecture,
+            is_user_marked: self.user_marked.get(pkg.name()).copied().unwrap_or(false),
+        })
+    }
+
+    fn selected_package(&self) -> Option<&PackageInfo> {
+        self.table_state
+            .selected()
+            .and_then(|i| self.packages.get(i))
+    }
+
+    fn get_selected_dependencies(&self) -> Vec<(String, String)> {
+        // Returns: Vec<(dep_type, target_name)>
+        let mut deps = Vec::new();
+
+        let pkg_name = match self.selected_package() {
+            Some(p) => p.name.clone(),
+            None => return deps,
+        };
+
+        let pkg = match self.cache.get(&pkg_name) {
+            Some(p) => p,
+            None => return deps,
+        };
+
+        let version = match pkg.candidate() {
+            Some(v) => v,
+            None => return deps,
+        };
+
+        // Get dependencies from the candidate version
+        if let Some(dependencies) = version.dependencies() {
+            for dep in dependencies {
+                let dep_type = dep.dep_type().to_string();
+
+                // Dependency derefs to Vec<BaseDep>, iterate through them
+                for base_dep in dep.iter() {
+                    let target = base_dep.name().to_string();
+                    deps.push((dep_type.clone(), target));
+                }
+            }
+        }
+
+        deps
+    }
+
+    fn toggle_details_tab(&mut self) {
+        self.details_tab = match self.details_tab {
+            DetailsTab::Info => DetailsTab::Dependencies,
+            DetailsTab::Dependencies => DetailsTab::Info,
+        };
+        self.detail_scroll = 0;
+    }
+
+    fn toggle_current(&mut self) {
+        if let Some(i) = self.table_state.selected() {
+            if let Some(pkg_info) = self.packages.get(i) {
+                let pkg_name = pkg_info.name.clone();
+                self.toggle_package(&pkg_name);
+            }
+        }
+    }
+
+    fn toggle_package(&mut self, name: &str) {
+        if let Some(pkg) = self.cache.get(name) {
+            let currently_marked = pkg.marked_install() || pkg.marked_upgrade();
+
+            if currently_marked {
+                // Unmarking - just do it directly (no confirmation needed)
+                pkg.mark_keep();
+                self.user_marked.remove(name);
+
+                if let Err(e) = self.cache.resolve(true) {
+                    self.status_message = format!("Dependency error: {}", e);
+                }
+
+                self.calculate_pending_changes();
+                self.apply_current_filter();
+                self.update_status_message();
+            } else if pkg.is_upgradable() || !pkg.is_installed() {
+                // Marking - preview additional changes first
+                self.preview_mark(name);
+            }
+        }
+    }
+
+    /// Preview what additional changes would occur if we mark this package
+    fn preview_mark(&mut self, name: &str) {
+        // Get current state of all packages before marking
+        let before: std::collections::HashSet<String> = self
+            .cache
+            .get_changes(false)
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Temporarily mark the package
+        if let Some(pkg) = self.cache.get(name) {
+            pkg.mark_install(true, true);
+            pkg.protect();
+        }
+
+        // Resolve dependencies
+        if let Err(e) = self.cache.resolve(true) {
+            self.status_message = format!("Dependency error: {}", e);
+            // Undo the mark
+            if let Some(pkg) = self.cache.get(name) {
+                pkg.mark_keep();
+            }
+            return;
+        }
+
+        // Get new state after marking
+        let mut additional_installs = Vec::new();
+        let mut additional_removes = Vec::new();
+        let mut download_size: u64 = 0;
+
+        for pkg in self.cache.get_changes(false) {
+            let pkg_name = pkg.name().to_string();
+
+            // Skip the package we're marking
+            if pkg_name == name {
+                if let Some(cand) = pkg.candidate() {
+                    download_size += cand.size();
+                }
+                continue;
+            }
+
+            // Only show packages that weren't already marked
+            if !before.contains(&pkg_name) {
+                if pkg.marked_install() {
+                    if let Some(cand) = pkg.candidate() {
+                        download_size += cand.size();
+                    }
+                    additional_installs.push(pkg_name);
+                } else if pkg.marked_delete() {
+                    additional_removes.push(pkg_name);
+                }
+            }
+        }
+
+        // If there are additional changes, show the confirmation popup
+        if !additional_installs.is_empty() || !additional_removes.is_empty() {
+            self.mark_preview = MarkPreview {
+                package_name: name.to_string(),
+                is_marking: true,
+                additional_installs,
+                additional_removes,
+                download_size,
+            };
+            self.state = AppState::ShowingMarkConfirm;
+        } else {
+            // No additional changes, just confirm the mark
+            self.confirm_mark();
+        }
+    }
+
+    /// User confirmed the mark, finalize it
+    fn confirm_mark(&mut self) {
+        let name = self.mark_preview.package_name.clone();
+        self.user_marked.insert(name, true);
+        self.calculate_pending_changes();
+        self.apply_current_filter();
+        self.update_status_message();
+        self.state = AppState::Listing;
+    }
+
+    /// User cancelled the mark, undo it
+    fn cancel_mark(&mut self) {
+        // Undo the main package
+        if let Some(pkg) = self.cache.get(&self.mark_preview.package_name) {
+            pkg.mark_keep();
+        }
+
+        // Undo all the auto-marked dependencies
+        for name in &self.mark_preview.additional_installs {
+            if let Some(pkg) = self.cache.get(name) {
+                pkg.mark_keep();
+            }
+        }
+
+        // Undo any auto-removed packages (restore them)
+        for name in &self.mark_preview.additional_removes {
+            if let Some(pkg) = self.cache.get(name) {
+                pkg.mark_keep();
+            }
+        }
+
+        self.mark_preview = MarkPreview::default();
+        self.calculate_pending_changes();
+        self.apply_current_filter();
+        self.update_status_message();
+        self.state = AppState::Listing;
+    }
+
+    fn mark_all_upgrades(&mut self) {
+        for pkg in self.cache.packages(&PackageSort::default()) {
+            if pkg.is_upgradable() {
+                pkg.mark_install(true, true);
+                pkg.protect();
+                self.user_marked.insert(pkg.name().to_string(), true);
+            }
+        }
+
+        if let Err(e) = self.cache.resolve(true) {
+            self.status_message = format!("Dependency error: {}", e);
+        }
+
+        self.calculate_pending_changes();
+        self.apply_current_filter();
+        self.update_status_message();
+    }
+
+    fn unmark_all(&mut self) {
+        for pkg in self.cache.packages(&PackageSort::default()) {
+            pkg.mark_keep();
+        }
+        self.user_marked.clear();
+
+        self.calculate_pending_changes();
+        self.apply_current_filter();
+        self.update_status_message();
+    }
+
+    fn calculate_pending_changes(&mut self) {
+        self.pending_changes = PendingChanges::default();
+
+        for pkg in self.cache.get_changes(false) {
+            let name = pkg.name().to_string();
+            let is_user = self.user_marked.get(&name).copied().unwrap_or(false);
+
+            if pkg.marked_install() {
+                if pkg.is_installed() {
+                    if is_user {
+                        self.pending_changes.to_upgrade.push(name);
+                    } else {
+                        self.pending_changes.auto_install.push(name);
+                    }
+                } else {
+                    if is_user {
+                        self.pending_changes.to_install.push(name);
+                    } else {
+                        self.pending_changes.auto_install.push(name);
+                    }
+                }
+
+                if let Some(cand) = pkg.candidate() {
+                    self.pending_changes.download_size += cand.size();
+                    self.pending_changes.install_size_change += cand.installed_size() as i64;
+                }
+            } else if pkg.marked_delete() {
+                if is_user {
+                    self.pending_changes.to_remove.push(name);
+                } else {
+                    self.pending_changes.auto_remove.push(name);
+                }
+
+                if let Some(inst) = pkg.installed() {
+                    self.pending_changes.install_size_change -= inst.installed_size() as i64;
+                }
+            }
+        }
+    }
+
+    fn show_changes_preview(&mut self) {
+        self.calculate_pending_changes();
+        if self.has_pending_changes() {
+            self.state = AppState::ShowingChanges;
+            self.changes_scroll = 0;
+        } else {
+            self.status_message = "No changes to apply".to_string();
+        }
+    }
+
+    fn has_pending_changes(&self) -> bool {
+        !self.pending_changes.to_install.is_empty()
+            || !self.pending_changes.to_upgrade.is_empty()
+            || !self.pending_changes.to_remove.is_empty()
+            || !self.pending_changes.auto_install.is_empty()
+            || !self.pending_changes.auto_remove.is_empty()
+    }
+
+    fn total_changes_count(&self) -> usize {
+        self.pending_changes.to_install.len()
+            + self.pending_changes.to_upgrade.len()
+            + self.pending_changes.to_remove.len()
+            + self.pending_changes.auto_install.len()
+            + self.pending_changes.auto_remove.len()
+    }
+
+    fn update_status_message(&mut self) {
+        let upgradable_count = self
+            .cache
+            .packages(&PackageSort::default())
+            .filter(|p| p.is_upgradable())
+            .count();
+
+        let changes = self.total_changes_count();
+
+        if changes > 0 {
+            self.status_message = format!(
+                "{} changes pending ({} download) | {} upgradable | Press 'u' to review",
+                changes,
+                PackageInfo::size_str(self.pending_changes.download_size),
+                upgradable_count
+            );
+        } else {
+            self.status_message = format!("{} packages upgradable", upgradable_count);
+        }
+    }
+
+    fn move_package_selection(&mut self, delta: i32) {
+        if self.packages.is_empty() {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0) as i32;
+        let new_idx = (current + delta).clamp(0, self.packages.len() as i32 - 1) as usize;
+        self.table_state.select(Some(new_idx));
+        self.detail_scroll = 0;
+    }
+
+    fn move_filter_selection(&mut self, delta: i32) {
+        let filters = FilterCategory::all();
+        let current = self.filter_state.selected().unwrap_or(0) as i32;
+        let new_idx = (current + delta).clamp(0, filters.len() as i32 - 1) as usize;
+        self.filter_state.select(Some(new_idx));
+        self.selected_filter = filters[new_idx];
+        self.apply_current_filter();
+        self.table_state.select(if self.packages.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+    }
+
+    fn cycle_focus(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            FocusedPane::Filters => FocusedPane::Packages,
+            FocusedPane::Packages => FocusedPane::Details,
+            FocusedPane::Details => FocusedPane::Filters,
+        };
+    }
+
+    fn is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn apply_changes(&mut self) -> ApplyResult {
+        if !Self::is_root() {
+            self.state = AppState::Listing;
+            self.status_message = "Root privileges required. Run with sudo.".to_string();
+            return ApplyResult::NotRoot;
+        }
+
+        self.state = AppState::Upgrading;
+        ApplyResult::NeedsCommit
+    }
+
+    fn commit_changes(&mut self) -> Result<()> {
+        // This runs outside the TUI context
+        println!("\n=== Applying changes ===\n");
+
+        let mut acquire_progress = AcquireProgress::apt();
+        let mut install_progress = InstallProgress::apt();
+
+        // Take ownership of cache for commit (it consumes self)
+        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+
+        match cache.commit(&mut acquire_progress, &mut install_progress) {
+            Ok(()) => {
+                println!("\n=== Changes applied successfully ===");
+                self.output_lines.push("Changes applied successfully.".to_string());
+                self.state = AppState::Done;
+                self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
+            }
+            Err(e) => {
+                println!("\n=== Error applying changes ===");
+                println!("{}", e);
+                self.output_lines.push(format!("Error: {}", e));
+                self.state = AppState::Done;
+                self.status_message = format!("Error: {}. Press 'q' to quit or 'r' to refresh.", e);
+            }
+        }
+
+        // Clear state after commit
+        self.user_marked.clear();
+        self.pending_changes = PendingChanges::default();
+        self.search_index = None;
+
+        Ok(())
+    }
+
+    fn refresh_cache(&mut self) -> Result<()> {
+        self.cache = Cache::new::<&str>(&[])?;
+        self.user_marked.clear();
+        self.pending_changes = PendingChanges::default();
+        self.search_index = None; // Force rebuild on next search
+        self.search_query.clear();
+        self.search_results = None;
+        self.reload_packages()?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    color_eyre::install()?;
+
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+    let mut app = App::new()?;
+
+    loop {
+        terminal.draw(|f| ui(f, &mut app))?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    // Terminal handles resize automatically on next draw
+                }
+                Event::Mouse(mouse) => {
+                    if app.state == AppState::Listing {
+                        match mouse.kind {
+                            MouseEventKind::Down(_) => {
+                                app.handle_mouse_click(mouse.column, mouse.row);
+                            }
+                            MouseEventKind::ScrollUp => {
+                                app.handle_mouse_scroll(mouse.column, mouse.row, true);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.handle_mouse_scroll(mouse.column, mouse.row, false);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    match app.state {
+                    AppState::Listing => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Tab => app.cycle_focus(),
+                        KeyCode::Char('/') => app.start_search(),
+                        KeyCode::Esc => {
+                            // Clear search filter
+                            if app.search_results.is_some() {
+                                app.search_query.clear();
+                                app.search_results = None;
+                                app.apply_current_filter();
+                                app.update_status_message();
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => match app.focused_pane {
+                            FocusedPane::Filters => app.move_filter_selection(-1),
+                            FocusedPane::Packages => app.move_package_selection(-1),
+                            FocusedPane::Details => {
+                                app.detail_scroll = app.detail_scroll.saturating_sub(1)
+                            }
+                        },
+                        KeyCode::Down | KeyCode::Char('j') => match app.focused_pane {
+                            FocusedPane::Filters => app.move_filter_selection(1),
+                            FocusedPane::Packages => app.move_package_selection(1),
+                            FocusedPane::Details => {
+                                app.detail_scroll = app.detail_scroll.saturating_add(1)
+                            }
+                        },
+                        KeyCode::PageDown => app.move_package_selection(10),
+                        KeyCode::PageUp => app.move_package_selection(-10),
+                        KeyCode::Char(' ') => {
+                            if app.focused_pane == FocusedPane::Packages {
+                                app.toggle_current();
+                            }
+                        }
+                        KeyCode::Char('a') => app.mark_all_upgrades(),
+                        KeyCode::Char('n') => app.unmark_all(),
+                        KeyCode::Char('d') => app.toggle_details_tab(),
+                        KeyCode::Char('u') | KeyCode::Enter => {
+                            if app.focused_pane == FocusedPane::Packages {
+                                app.show_changes_preview();
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            let _ = app.refresh_cache();
+                        }
+                        _ => {}
+                    },
+                    AppState::Searching => match key.code {
+                        KeyCode::Esc => app.cancel_search(),
+                        KeyCode::Enter => app.confirm_search(),
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.execute_search();
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.execute_search();
+                        }
+                        _ => {}
+                    },
+                    AppState::ShowingMarkConfirm => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            app.confirm_mark();
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                            app.cancel_mark();
+                        }
+                        _ => {}
+                    },
+                    AppState::ShowingChanges => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            match app.apply_changes() {
+                                ApplyResult::NotRoot => {
+                                    // Status message already set, just continue
+                                }
+                                ApplyResult::NeedsCommit => {
+                                    // Exit TUI temporarily for apt output
+                                    disable_raw_mode()?;
+                                    io::stdout().execute(LeaveAlternateScreen)?;
+
+                                    // Run the actual commit
+                                    let _ = app.commit_changes();
+
+                                    // Wait for user to acknowledge
+                                    println!("\nPress Enter to continue...");
+                                    let mut input = String::new();
+                                    let _ = std::io::stdin().read_line(&mut input);
+
+                                    // Re-enter TUI
+                                    enable_raw_mode()?;
+                                    io::stdout().execute(EnterAlternateScreen)?;
+
+                                    // Refresh the cache
+                                    let _ = app.refresh_cache();
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                            app.state = AppState::Listing;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.changes_scroll = app.changes_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.changes_scroll = app.changes_scroll.saturating_add(1);
+                        }
+                        _ => {}
+                    },
+                    AppState::Upgrading => {}
+                    AppState::Done => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('r') => {
+                            app.state = AppState::Listing;
+                            let _ = app.refresh_cache();
+                        }
+                        _ => {}
+                    },
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    io::stdout().execute(DisableMouseCapture)?;
+    disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    Ok(())
+}
+
+fn ui(frame: &mut Frame, app: &mut App) {
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let changes_count = app.total_changes_count();
+    let title_text = if changes_count > 0 {
+        format!(
+            " APT TUI │ {} changes │ {} download ",
+            changes_count,
+            PackageInfo::size_str(app.pending_changes.download_size)
+        )
+    } else {
+        " APT TUI │ No changes pending ".to_string()
+    };
+    let title = Paragraph::new(title_text)
+        .style(Style::default().fg(Color::White).bg(Color::Blue).bold());
+    frame.render_widget(title, main_chunks[0]);
+
+    match app.state {
+        AppState::Listing | AppState::Searching => {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(16),
+                    Constraint::Min(40),
+                    Constraint::Length(35),
+                ])
+                .split(main_chunks[1]);
+
+            // Store areas for mouse handling
+            app.filter_area = panes[0];
+            app.package_area = panes[1];
+            app.details_area = panes[2];
+
+            render_filter_pane(frame, app, panes[0]);
+            render_package_table(frame, app, panes[1]);
+            render_details_pane(frame, app, panes[2]);
+        }
+        AppState::ShowingMarkConfirm => {
+            // Render the package list in background
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(16),
+                    Constraint::Min(40),
+                    Constraint::Length(35),
+                ])
+                .split(main_chunks[1]);
+
+            app.filter_area = panes[0];
+            app.package_area = panes[1];
+            app.details_area = panes[2];
+
+            render_filter_pane(frame, app, panes[0]);
+            render_package_table(frame, app, panes[1]);
+            render_details_pane(frame, app, panes[2]);
+
+            // Overlay the confirmation modal
+            render_mark_confirm_modal(frame, app, main_chunks[1]);
+        }
+        AppState::ShowingChanges => {
+            render_changes_modal(frame, app, main_chunks[1]);
+        }
+        AppState::Upgrading | AppState::Done => {
+            let output_text = app.output_lines.join("\n");
+            let output = Paragraph::new(output_text)
+                .block(Block::default().title(" Output ").borders(Borders::ALL))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(output, main_chunks[1]);
+        }
+    }
+
+    let status_style = match app.state {
+        AppState::Listing => Style::default().fg(Color::Yellow),
+        AppState::Searching => Style::default().fg(Color::White),
+        AppState::ShowingMarkConfirm => Style::default().fg(Color::Magenta),
+        AppState::ShowingChanges => Style::default().fg(Color::Cyan),
+        AppState::Upgrading => Style::default().fg(Color::Cyan),
+        AppState::Done => Style::default().fg(Color::Green),
+    };
+    let status_text = match app.state {
+        AppState::Searching => format!("/{}_", app.search_query),
+        AppState::ShowingMarkConfirm => format!(
+            "Mark '{}' requires additional changes",
+            app.mark_preview.package_name
+        ),
+        _ => {
+            // Show active search filter in status if present
+            if app.search_results.is_some() {
+                format!("[Search: {}] {}", app.search_query, app.status_message)
+            } else {
+                app.status_message.clone()
+            }
+        }
+    };
+    let status = Paragraph::new(status_text)
+        .style(status_style)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(status, main_chunks[2]);
+
+    let help_text = match app.state {
+        AppState::Listing => {
+            if app.search_results.is_some() {
+                "/:Search │ Esc:Clear │ Space:Mark │ d:Deps │ a:All │ n:None │ u:Apply │ q:Quit"
+            } else {
+                "/:Search │ Space:Mark │ d:Deps │ a:All │ n:None │ u:Apply │ r:Refresh │ q:Quit"
+            }
+        }
+        AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
+        AppState::ShowingMarkConfirm => "y/Enter:Confirm │ n/Esc:Cancel",
+        AppState::ShowingChanges => "y/Enter:Apply │ n/Esc:Cancel │ ↑↓:Scroll",
+        AppState::Upgrading => "Applying changes...",
+        AppState::Done => "r:Refresh │ q:Quit",
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    frame.render_widget(help, main_chunks[3]);
+}
+
+fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focused_pane == FocusedPane::Filters;
+
+    let items: Vec<ListItem> = FilterCategory::all()
+        .iter()
+        .map(|cat| {
+            let style = if *cat == app.selected_filter {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default()
+            };
+            ListItem::new(cat.label()).style(style)
+        })
+        .collect();
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Filters ")
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut app.filter_state.clone());
+}
+
+fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focused_pane == FocusedPane::Packages;
+    let visible_cols = Column::visible_columns();
+
+    let header_cells: Vec<Cell> = visible_cols
+        .iter()
+        .map(|col| Cell::from(col.header()).style(Style::default().fg(Color::Cyan).bold()))
+        .collect();
+    let header = Row::new(header_cells).height(1);
+
+    let rows: Vec<Row> = app
+        .packages
+        .iter()
+        .map(|pkg| {
+            let cells: Vec<Cell> = visible_cols
+                .iter()
+                .map(|col| match col {
+                    Column::Status => Cell::from(pkg.status.symbol())
+                        .style(Style::default().fg(pkg.status.color())),
+                    Column::Name => {
+                        let style = if pkg.is_user_marked {
+                            Style::default().fg(Color::White).bold()
+                        } else {
+                            Style::default()
+                        };
+                        Cell::from(pkg.name.clone()).style(style)
+                    }
+                    Column::Section => Cell::from(pkg.section.clone()),
+                    Column::InstalledVersion => {
+                        if pkg.installed_version.is_empty() {
+                            Cell::from("-")
+                        } else {
+                            Cell::from(pkg.installed_version.clone())
+                        }
+                    }
+                    Column::CandidateVersion => Cell::from(pkg.candidate_version.clone())
+                        .style(Style::default().fg(Color::Green)),
+                    Column::DownloadSize => Cell::from(pkg.download_size_str()),
+                })
+                .collect();
+
+            Row::new(cells)
+        })
+        .collect();
+
+    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width()).collect();
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .title(format!(" Packages ({}) ", app.packages.len()))
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(table, area, &mut app.table_state);
+
+    if !app.packages.is_empty() {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+
+        let mut scrollbar_state = ScrollbarState::new(app.packages.len())
+            .position(app.table_state.selected().unwrap_or(0));
+
+        let scrollbar_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y + 1,
+            width: 1,
+            height: area.height.saturating_sub(2),
+        };
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+}
+
+fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focused_pane == FocusedPane::Details;
+
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // Tab header
+    let info_style = if app.details_tab == DetailsTab::Info {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let deps_style = if app.details_tab == DetailsTab::Dependencies {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let mut content = vec![
+        Line::from(vec![
+            Span::styled("[Info]", info_style),
+            Span::raw(" "),
+            Span::styled("[Deps]", deps_style),
+            Span::styled("  (d to switch)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+    ];
+
+    if let Some(pkg) = app.selected_package() {
+        match app.details_tab {
+            DetailsTab::Info => {
+                content.extend(vec![
+                    Line::from(vec![
+                        Span::styled("Package: ", Style::default().fg(Color::Cyan).bold()),
+                        Span::raw(&pkg.name),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Status: ", Style::default().fg(Color::Cyan)),
+                        Span::styled(pkg.status.symbol(), Style::default().fg(pkg.status.color())),
+                        Span::raw(format!(" {:?}", pkg.status)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Section: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(&pkg.section),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Arch: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(&pkg.architecture),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Installed: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(if pkg.installed_version.is_empty() {
+                            "(none)"
+                        } else {
+                            &pkg.installed_version
+                        }),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Candidate: ", Style::default().fg(Color::Green)),
+                        Span::raw(&pkg.candidate_version),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Download: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(pkg.download_size_str()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Inst Size: ", Style::default().fg(Color::Cyan)),
+                        Span::raw(pkg.installed_size_str()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Description:",
+                        Style::default().fg(Color::Cyan).bold(),
+                    )),
+                    Line::from(pkg.description.clone()),
+                ]);
+            }
+            DetailsTab::Dependencies => {
+                let deps = app.get_selected_dependencies();
+
+                if deps.is_empty() {
+                    content.push(Line::from(Span::styled(
+                        "No dependencies",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    // Group by dep type
+                    let mut current_type = String::new();
+
+                    for (dep_type, target) in deps {
+                        if dep_type != current_type {
+                            if !current_type.is_empty() {
+                                content.push(Line::from(""));
+                            }
+                            content.push(Line::from(Span::styled(
+                                format!("{}:", dep_type),
+                                Style::default().fg(Color::Cyan).bold(),
+                            )));
+                            current_type = dep_type;
+                        }
+
+                        // Check if target is installed
+                        let is_installed = app.cache.get(&target)
+                            .map(|p| p.is_installed())
+                            .unwrap_or(false);
+
+                        let style = if is_installed {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Yellow)
+                        };
+
+                        let symbol = if is_installed { "✓" } else { "○" };
+                        content.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(symbol, style),
+                            Span::raw(" "),
+                            Span::styled(target, style),
+                        ]));
+                    }
+                }
+            }
+        }
+    } else {
+        content.push(Line::from(Span::styled(
+            "No package selected",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let title = match app.details_tab {
+        DetailsTab::Info => " Details ",
+        DetailsTab::Dependencies => " Dependencies ",
+    };
+
+    let details = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.detail_scroll, 0));
+
+    frame.render_widget(details, area);
+}
+
+fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let preview = &app.mark_preview;
+
+    // Build content first to calculate height
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Mark this package requires additional changes:",
+            Style::default().bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Package: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&preview.package_name, Style::default().bold()),
+        ]),
+        Line::from(""),
+    ];
+
+    if !preview.additional_installs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("The following {} packages will be INSTALLED:", preview.additional_installs.len()),
+            Style::default().fg(Color::Green).bold(),
+        )));
+        for name in &preview.additional_installs {
+            lines.push(Line::from(Span::styled(
+                format!("  + {}", name),
+                Style::default().fg(Color::Green),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !preview.additional_removes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("The following {} packages will be REMOVED:", preview.additional_removes.len()),
+            Style::default().fg(Color::Red).bold(),
+        )));
+        for name in &preview.additional_removes {
+            lines.push(Line::from(Span::styled(
+                format!("  - {}", name),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Total download: {}",
+        PackageInfo::size_str(preview.download_size)
+    )));
+
+    // Calculate modal size based on content
+    let content_height = lines.len() as u16 + 2; // +2 for borders
+    let modal_width = 60.min(area.width.saturating_sub(4));
+    let modal_height = content_height.min(area.height.saturating_sub(2));
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Additional Changes Required ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(modal, modal_area);
+}
+
+fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let modal_width = 60.min(area.width.saturating_sub(4));
+    let modal_height = 20.min(area.height.saturating_sub(2));
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "The following changes will be made:",
+            Style::default().bold(),
+        )),
+        Line::from(""),
+    ];
+
+    if !app.pending_changes.to_upgrade.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("UPGRADE ({}):", app.pending_changes.to_upgrade.len()),
+            Style::default().fg(Color::Yellow).bold(),
+        )));
+        for name in &app.pending_changes.to_upgrade {
+            lines.push(Line::from(format!("  ↑ {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !app.pending_changes.to_install.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("INSTALL ({}):", app.pending_changes.to_install.len()),
+            Style::default().fg(Color::Green).bold(),
+        )));
+        for name in &app.pending_changes.to_install {
+            lines.push(Line::from(format!("  + {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !app.pending_changes.auto_install.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "AUTO-INSTALL (dependencies) ({}):",
+                app.pending_changes.auto_install.len()
+            ),
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        for name in &app.pending_changes.auto_install {
+            lines.push(Line::from(format!("  A {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !app.pending_changes.to_remove.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("REMOVE ({}):", app.pending_changes.to_remove.len()),
+            Style::default().fg(Color::Red).bold(),
+        )));
+        for name in &app.pending_changes.to_remove {
+            lines.push(Line::from(format!("  - {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !app.pending_changes.auto_remove.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "AUTO-REMOVE (no longer needed) ({}):",
+                app.pending_changes.auto_remove.len()
+            ),
+            Style::default().fg(Color::Magenta).bold(),
+        )));
+        for name in &app.pending_changes.auto_remove {
+            lines.push(Line::from(format!("  X {}", name)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Download size: {}",
+        PackageInfo::size_str(app.pending_changes.download_size)
+    )));
+
+    let size_change = if app.pending_changes.install_size_change >= 0 {
+        format!(
+            "+{}",
+            PackageInfo::size_str(app.pending_changes.install_size_change as u64)
+        )
+    } else {
+        format!(
+            "-{}",
+            PackageInfo::size_str((-app.pending_changes.install_size_change) as u64)
+        )
+    };
+    lines.push(Line::from(format!("Disk space change: {}", size_change)));
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Changes ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.changes_scroll, 0));
+
+    frame.render_widget(modal, modal_area);
+}
