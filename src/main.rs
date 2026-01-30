@@ -930,6 +930,7 @@ impl App {
 
         // UNDO - restore cache to previous state before showing preview
         self.restore_marks();
+        self.apply_current_filter();
 
         // If there are additional changes, show the confirmation popup
         if !additional_installs.is_empty() || !additional_removes.is_empty() {
@@ -1001,6 +1002,8 @@ impl App {
     /// User cancelled the mark - nothing to undo since we didn't apply yet
     fn cancel_mark(&mut self) {
         self.mark_preview = MarkPreview::default();
+        self.calculate_pending_changes();
+        self.update_status_message();
         self.state = AppState::Listing;
     }
 
