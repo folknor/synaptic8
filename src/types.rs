@@ -1,6 +1,5 @@
 //! Common types used throughout the application
 
-use std::collections::HashSet;
 use ratatui::prelude::*;
 
 /// Package status matching Synaptic's status icons
@@ -315,38 +314,5 @@ impl ColumnWidths {
         self.section = 7;   // "Section"
         self.installed = 9; // "Installed"
         self.candidate = 9; // "Candidate"
-    }
-}
-
-/// Search state
-#[derive(Debug, Default)]
-pub struct SearchState {
-    pub query: String,
-    pub results: Option<HashSet<String>>,
-    pub build_time: Option<std::time::Duration>,
-}
-
-/// UI scroll positions
-#[derive(Debug, Default)]
-pub struct ScrollState {
-    pub detail: u16,
-    pub changes: u16,
-    pub mark_confirm: u16,
-    pub changelog: u16,
-}
-
-/// Visual selection mode state
-#[derive(Debug, Default)]
-pub struct VisualMode {
-    pub active: bool,
-    pub anchor: Option<usize>,
-    pub selected: HashSet<usize>,
-}
-
-impl VisualMode {
-    pub fn clear(&mut self) {
-        self.active = false;
-        self.anchor = None;
-        self.selected.clear();
     }
 }
