@@ -266,17 +266,17 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        Cell::from(pkg.name.clone()).style(style)
+                        Cell::from(pkg.name.as_str()).style(style)
                     }
-                    Column::Section => Cell::from(pkg.section.clone()),
+                    Column::Section => Cell::from(pkg.section.as_str()),
                     Column::InstalledVersion => {
                         if pkg.installed_version.is_empty() {
                             Cell::from("-")
                         } else {
-                            Cell::from(pkg.installed_version.clone())
+                            Cell::from(pkg.installed_version.as_str())
                         }
                     }
-                    Column::CandidateVersion => Cell::from(pkg.candidate_version.clone())
+                    Column::CandidateVersion => Cell::from(pkg.candidate_version.as_str())
                         .style(Style::default().fg(Color::Green)),
                     Column::DownloadSize => Cell::from(pkg.download_size_str()),
                 })
@@ -417,7 +417,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                         "Description:",
                         Style::default().fg(Color::Cyan).bold(),
                     )),
-                    Line::from(pkg.description.clone()),
+                    Line::from(pkg.description.as_str()),
                 ]);
             }
             DetailsTab::Dependencies => {
@@ -450,7 +450,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                             Span::raw("  "),
                             Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
                             Span::raw(" "),
-                            Span::raw(target.clone()),
+                            Span::raw(target.as_str()),
                         ]));
                     }
                 }
@@ -491,7 +491,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                             Span::raw("  "),
                             Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
                             Span::raw(" "),
-                            Span::raw(pkg_name.clone()),
+                            Span::raw(pkg_name.as_str()),
                         ]));
                     }
                 }

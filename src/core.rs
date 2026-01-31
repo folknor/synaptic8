@@ -406,11 +406,9 @@ impl PackageManager {
         Ok(())
     }
 
-    /// Restore marks to user-marked state
+    /// Restore marks to user-marked state (fast, no cache reload)
     fn restore_marks(&mut self) {
-        if let Err(e) = self.apt.refresh() {
-            eprintln!("Warning: cache refresh failed: {}", e);
-        }
+        self.apt.restore_to_user_marks();
     }
 
     // === Dependency Queries ===

@@ -276,12 +276,23 @@ impl AptManager {
 
     // === Cache refresh and restore ===
 
-    /// Reload the cache and reapply user marks
-    pub fn refresh(&mut self) -> Result<()> {
-        // Reload cache
-        self.cache = Cache::new::<&str>(&[])?;
+    /// Restore cache to user-marked state without reloading
+    /// This is faster than refresh() for undoing temporary marks (e.g., preview)
+    pub fn restore_to_user_marks(&mut self) {
+        // Get all currently changed packages
+        let changed: Vec<String> = self.cache
+            .get_changes(false)
+            .map(|p| p.name().to_string())
+            .collect();
 
-        // Re-apply only user-marked packages
+        // Clear all marks
+        for name in &changed {
+            if let Some(pkg) = self.cache.get(name) {
+                pkg.mark_keep();
+            }
+        }
+
+        // Re-apply user marks
         for name in self.user_marked.keys() {
             if let Some(pkg) = self.cache.get(name) {
                 pkg.mark_install(true, true);
@@ -293,8 +304,6 @@ impl AptManager {
         if !self.user_marked.is_empty() {
             let _ = self.cache.resolve(true);
         }
-
-        Ok(())
     }
 
     /// Full refresh clearing all marks

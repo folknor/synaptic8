@@ -9,7 +9,6 @@
 
 ### Performance
 - [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
-- [ ] Avoid per-frame string clones in render loop (use `Cow` or references)
 
 
 ### UI/UX
@@ -54,7 +53,6 @@
 - [ ] Make state transitions more explicit (typestate pattern or state machine)
 - [ ] Remember scroll position when switching filter categories
 - [ ] Make search query more visually prominent when active
-- [ ] Consider lazy evaluation or async loading for cache reload in `restore_marks()`
 
 ### Documentation
 - [ ] Man page
