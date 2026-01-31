@@ -145,6 +145,7 @@ pub enum AppState {
     ShowingChanges,     // Final confirmation before applying all changes
     ShowingChangelog,   // Viewing package changelog
     ShowingSettings,    // Settings/preferences view
+    ConfirmExit,        // Confirm exit with pending changes
     EnteringPassword,   // Entering sudo password
     Upgrading,
     Done,

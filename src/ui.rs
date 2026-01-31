@@ -76,6 +76,24 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingSettings => {
             render_settings_view(frame, app, main_chunks[1]);
         }
+        AppState::ConfirmExit => {
+            // Render the package list in background
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(19),
+                    Constraint::Min(40),
+                    Constraint::Length(35),
+                ])
+                .split(main_chunks[1]);
+
+            render_filter_pane(frame, app, panes[0]);
+            render_package_table(frame, app, panes[1]);
+            render_details_pane(frame, app, panes[2]);
+
+            // Overlay the exit confirmation modal
+            render_exit_confirm_modal(frame, app, main_chunks[1]);
+        }
         AppState::EnteringPassword => {
             render_password_input(frame, app, main_chunks[1]);
         }
@@ -95,6 +113,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChanges => Style::default().fg(Color::Cyan),
         AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
         AppState::ShowingSettings => Style::default().fg(Color::Yellow),
+        AppState::ConfirmExit => Style::default().fg(Color::Red),
         AppState::EnteringPassword => Style::default().fg(Color::Yellow),
         AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
@@ -134,6 +153,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChanges => "y/Enter:Apply │ n/Esc:Cancel │ ↑↓:Scroll",
         AppState::ShowingChangelog => "↑↓/PgUp/PgDn:Scroll │ Esc/q:Close",
         AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
+        AppState::ConfirmExit => "y/Enter:Quit │ n/Esc:Cancel",
         AppState::EnteringPassword => "Enter:Submit │ Esc:Cancel │ Type password...",
         AppState::Upgrading => "Applying changes...",
         AppState::Done => "r:Refresh │ q:Quit",
@@ -878,6 +898,44 @@ fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         );
+
+    frame.render_widget(modal, modal_area);
+}
+
+fn render_exit_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let modal_width = 50.min(area.width.saturating_sub(4));
+    let modal_height = 9;
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let changes = app.total_changes_count();
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "You have unsaved changes!",
+            Style::default().fg(Color::Red).bold(),
+        )),
+        Line::from(""),
+        Line::from(format!("{} pending changes will be lost.", changes)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Are you sure you want to quit?",
+            Style::default().bold(),
+        )),
+        Line::from(""),
+    ];
+
+    let modal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(" Confirm Exit ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center);
 
     frame.render_widget(modal, modal_area);
 }

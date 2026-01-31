@@ -4,12 +4,8 @@
 
 ### Missing Core Features
 - [ ] Add ability to mark packages for removal (not just install/upgrade)
-- [ ] Add confirmation dialog when exiting with pending changes
 
 ## High Priority
-
-### Error Handling
-- [ ] Show specific conflict information when dependency resolution fails
 
 ### Performance
 - [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
@@ -18,7 +14,6 @@
 
 ### UI/UX
 - [ ] Add scrollbar position indicator to modals
-- [ ] Ensure table viewport scrolls to keep selection visible
 - [ ] Live output during upgrade (async)
 - [ ] Progress bar for downloads
 - [ ] Confirm dialog styling
@@ -43,9 +38,6 @@
 - [ ] Test with `NO_COLOR` environment variable
 - [ ] Theming/color customization
 
-### Code Quality
-- [ ] Make state transitions more explicit (typestate pattern or state machine)
-
 ### Error Messages
 - [ ] Show "Resuming interrupted operation" when APT detects partial commit
 
@@ -59,6 +51,7 @@
 - [ ] Expose dependency resolution "fix broken" mode as user option
 
 ### Polish
+- [ ] Make state transitions more explicit (typestate pattern or state machine)
 - [ ] Remember scroll position when switching filter categories
 - [ ] Make search query more visually prominent when active
 - [ ] Consider lazy evaluation or async loading for cache reload in `restore_marks()`

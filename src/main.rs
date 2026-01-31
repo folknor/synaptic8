@@ -41,7 +41,13 @@ fn main() -> Result<()> {
 
                 match app.state {
                     AppState::Listing => match key.code {
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => {
+                            if app.has_pending_changes() {
+                                app.state = AppState::ConfirmExit;
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             app.cycle_focus_back()
                         }
@@ -191,6 +197,13 @@ fn main() -> Result<()> {
                         KeyCode::Down | KeyCode::Char('j') => app.scroll_changelog(1),
                         KeyCode::PageUp => app.scroll_changelog(-10),
                         KeyCode::PageDown => app.scroll_changelog(10),
+                        _ => {}
+                    },
+                    AppState::ConfirmExit => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => break,
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            app.state = AppState::Listing;
+                        }
                         _ => {}
                     },
                     AppState::EnteringPassword => match key.code {

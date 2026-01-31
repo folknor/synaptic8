@@ -10,7 +10,7 @@ use std::os::unix::io::AsRawFd;
 use color_eyre::Result;
 use rust_apt::cache::PackageSort;
 
-use crate::apt::AptManager;
+use crate::apt::{AptManager, format_apt_errors};
 use crate::search::SearchIndex;
 use crate::types::*;
 
@@ -240,7 +240,7 @@ impl PackageManager {
             // Unmarking
             self.apt.mark_keep(name);
             if let Err(e) = self.apt.resolve() {
-                return ToggleResult::Error(format!("Dependency error: {}", e));
+                return ToggleResult::Error(format!("Dependency conflict: {}", format_apt_errors(&e)));
             }
             self.pending = self.apt.calculate_pending();
             ToggleResult::Unmarked
@@ -276,7 +276,7 @@ impl PackageManager {
         // Resolve dependencies
         if let Err(e) = self.apt.resolve() {
             self.restore_marks();
-            return PreviewResult::Error(format!("Dependency error: {}", e));
+            return PreviewResult::Error(format!("Dependency conflict: {}", format_apt_errors(&e)));
         }
 
         // Calculate diff
@@ -359,7 +359,7 @@ impl PackageManager {
         }
 
         if let Err(e) = self.apt.resolve() {
-            return Err(format!("Dependency error: {}", e));
+            return Err(format!("Dependency conflict: {}", format_apt_errors(&e)));
         }
 
         self.pending = self.apt.calculate_pending();
@@ -399,7 +399,7 @@ impl PackageManager {
         }
 
         if let Err(e) = self.apt.resolve() {
-            return Err(format!("Dependency error: {}", e));
+            return Err(format!("Dependency conflict: {}", format_apt_errors(&e)));
         }
 
         self.pending = self.apt.calculate_pending();

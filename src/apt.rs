@@ -335,3 +335,25 @@ fn dep_type_order(t: &str) -> u8 {
         _ => 5,
     }
 }
+
+/// Format AptErrors into a user-friendly string with specific conflict details
+pub fn format_apt_errors(errors: &AptErrors) -> String {
+    let mut messages = Vec::new();
+
+    for error in errors.iter() {
+        let msg = error.to_string();
+        // Skip empty or generic messages
+        if !msg.is_empty() && msg != "E:" {
+            messages.push(msg);
+        }
+    }
+
+    if messages.is_empty() {
+        "Dependency resolution failed (no specific details available)".to_string()
+    } else if messages.len() == 1 {
+        messages[0].clone()
+    } else {
+        // Join multiple errors
+        format!("{}; and {} more issue(s)", messages[0], messages.len() - 1)
+    }
+}
