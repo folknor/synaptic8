@@ -2,10 +2,6 @@
 
 ## Critical
 
-### Security
-- [ ] Use `zeroize` crate to securely clear `sudo_password` from memory
-- [ ] Use absolute path `/usr/bin/sudo` instead of `sudo` to prevent PATH hijacking
-
 ### Missing Core Features
 - [ ] Add ability to mark packages for removal (not just install/upgrade)
 - [ ] Add confirmation dialog when exiting with pending changes
@@ -20,8 +16,6 @@
 - [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
 - [ ] Avoid per-frame string clones in render loop (use `Cow` or references)
 
-### Architecture
-- [ ] Move `update_cached_deps()` out of render function (side effect in render)
 
 ### UI/UX
 - [ ] Add scrollbar position indicator to modals

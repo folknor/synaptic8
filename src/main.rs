@@ -13,6 +13,8 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
+use zeroize::Zeroize;
+
 use app::App;
 use types::*;
 use ui::ui;
@@ -191,7 +193,7 @@ fn main() -> Result<()> {
                     },
                     AppState::EnteringPassword => match key.code {
                         KeyCode::Esc => {
-                            app.sudo_password.clear();
+                            app.sudo_password.zeroize();
                             app.state = AppState::ShowingChanges;
                         }
                         KeyCode::Enter => {

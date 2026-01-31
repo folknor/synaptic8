@@ -7,6 +7,7 @@ use ratatui::widgets::{ListState, TableState};
 use rust_apt::cache::{Cache, PackageSort};
 use rust_apt::progress::{AcquireProgress, InstallProgress};
 use rust_apt::{Package, Version};
+use zeroize::Zeroize;
 
 use crate::search::SearchIndex;
 use crate::types::*;
@@ -1045,7 +1046,7 @@ impl App {
 
     pub fn apply_changes(&mut self) -> ApplyResult {
         if !Self::is_root() {
-            self.sudo_password.clear();
+            self.sudo_password.zeroize();
             self.state = AppState::EnteringPassword;
             return ApplyResult::NeedsPassword;
         }
@@ -1123,7 +1124,8 @@ impl App {
         }
 
         // Run sudo -S apt-get ... (capture stderr for error reporting)
-        let mut child = Command::new("sudo")
+        // Use absolute path to prevent PATH hijacking attacks
+        let mut child = Command::new("/usr/bin/sudo")
             .arg("-S")
             .args(&args)
             .stdin(Stdio::piped())
@@ -1136,7 +1138,7 @@ impl App {
         }
 
         // Clear password from memory
-        self.sudo_password.clear();
+        self.sudo_password.zeroize();
 
         // Capture stderr (ignore read errors - we'll just have empty output)
         let mut stderr_output = String::new();
