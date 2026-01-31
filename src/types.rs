@@ -5,22 +5,22 @@ use ratatui::prelude::*;
 /// Package status matching Synaptic's status icons
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageStatus {
-    Upgradable,   // ↑ Package can be upgraded (yellow)
-    Upgrade,      // ↑ Package marked for upgrade (green)
-    Install,      // + Package marked for install
-    Remove,       // - Package marked for removal
-    Keep,         // = Package kept at current version
-    Installed,    // · Package is installed (no changes)
-    NotInstalled, //   Package is not installed
-    Broken,       // ✗ Package is broken
-    AutoInstall,  // + Automatically installed (dependency)
-    AutoRemove,   // - Automatically removed
+    Upgradable,      // ↑ Package can be upgraded (yellow)
+    MarkedForUpgrade, // ↑ Package marked for upgrade (green)
+    Install,         // + Package marked for install
+    Remove,          // - Package marked for removal
+    Keep,            // = Package kept at current version
+    Installed,       // · Package is installed (no changes)
+    NotInstalled,    //   Package is not installed
+    Broken,          // ✗ Package is broken
+    AutoInstall,     // + Automatically installed (dependency)
+    AutoRemove,      // - Automatically removed
 }
 
 impl PackageStatus {
     pub fn symbol(&self) -> &'static str {
         match self {
-            Self::Upgradable | Self::Upgrade => "↑",
+            Self::Upgradable | Self::MarkedForUpgrade => "↑",
             Self::Install | Self::AutoInstall => "+",
             Self::Remove | Self::AutoRemove => "-",
             Self::Keep => "=",
@@ -33,7 +33,7 @@ impl PackageStatus {
     pub fn color(&self) -> Color {
         match self {
             Self::Upgradable => Color::Yellow,
-            Self::Upgrade => Color::Green,
+            Self::MarkedForUpgrade => Color::Green,
             Self::Install | Self::AutoInstall => Color::Green,
             Self::Remove | Self::AutoRemove => Color::Red,
             Self::Keep => Color::Blue,

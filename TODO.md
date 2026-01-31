@@ -13,7 +13,6 @@
 ## High Priority
 
 ### Error Handling
-- [ ] Stop silently discarding `Result` values with `let _ =` pattern
 - [ ] Show specific conflict information when dependency resolution fails
 
 ### Performance
@@ -52,8 +51,6 @@
 - [ ] Theming/color customization
 
 ### Code Quality
-- [ ] Add `#[must_use]` attributes to functions like `has_pending_changes()`, `is_root()`
-- [ ] Rename `PackageStatus::Upgrade` to `MarkedForUpgrade` for clarity
 - [ ] Make state transitions more explicit (typestate pattern or state machine)
 - [ ] Extract APT cache wrapper to separate `apt.rs` module
 

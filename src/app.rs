@@ -201,10 +201,10 @@ impl App {
         match self.pkg.cache.get(name) {
             Some(pkg) => {
                 if pkg.marked_upgrade() {
-                    PackageStatus::Upgrade
+                    PackageStatus::MarkedForUpgrade
                 } else if pkg.marked_install() {
                     if pkg.is_installed() {
-                        PackageStatus::Upgrade
+                        PackageStatus::MarkedForUpgrade
                     } else if self.pkg.user_marked.get(name).copied().unwrap_or(false) {
                         PackageStatus::Install
                     } else {
@@ -372,11 +372,11 @@ impl App {
 
         let status = if pkg.marked_upgrade() {
             // Upgrade is always for installed packages
-            PackageStatus::Upgrade
+            PackageStatus::MarkedForUpgrade
         } else if pkg.marked_install() {
             if pkg.is_installed() {
                 // Installed package marked for install = upgrade
-                PackageStatus::Upgrade
+                PackageStatus::MarkedForUpgrade
             } else if self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false) {
                 PackageStatus::Install
             } else {
@@ -873,6 +873,7 @@ impl App {
         }
     }
 
+    #[must_use]
     pub fn has_pending_changes(&self) -> bool {
         !self.pkg.pending.to_install.is_empty()
             || !self.pkg.pending.to_upgrade.is_empty()
@@ -881,6 +882,7 @@ impl App {
             || !self.pkg.pending.auto_remove.is_empty()
     }
 
+    #[must_use]
     pub fn total_changes_count(&self) -> usize {
         self.pkg.pending.to_install.len()
             + self.pkg.pending.to_upgrade.len()
@@ -1007,6 +1009,7 @@ impl App {
         };
     }
 
+    #[must_use]
     pub fn is_root() -> bool {
         unsafe { libc::geteuid() == 0 }
     }
@@ -1135,10 +1138,12 @@ impl App {
         // Clear password from memory
         self.sudo_password.clear();
 
-        // Capture stderr
+        // Capture stderr (ignore read errors - we'll just have empty output)
         let mut stderr_output = String::new();
         if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut stderr_output);
+            if let Err(e) = stderr.read_to_string(&mut stderr_output) {
+                stderr_output = format!("(failed to read stderr: {})", e);
+            }
         }
 
         // Wait for completion
