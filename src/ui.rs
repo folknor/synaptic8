@@ -25,7 +25,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         format!(
             " APT TUI │ {} changes │ {} download ",
             changes_count,
-            PackageInfo::size_str(app.pkg.pending.download_size)
+            PackageInfo::size_str(app.core.pending.download_size)
         )
     } else {
         " APT TUI │ No changes pending ".to_string()
@@ -100,15 +100,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Done => Style::default().fg(Color::Green),
     };
     let status_text = match app.state {
-        AppState::Searching => format!("/{}_", app.search.query),
+        AppState::Searching => format!("/{}_", app.core.search.query),
         AppState::ShowingMarkConfirm => format!(
             "Mark '{}' requires additional changes",
-            app.pkg.mark_preview.package_name
+            app.core.mark_preview.package_name
         ),
         _ => {
             // Show active search filter in status if present
-            if app.search.results.is_some() {
-                format!("[Search: {}] {}", app.search.query, app.status_message)
+            if app.core.search.results.is_some() {
+                format!("[Search: {}] {}", app.core.search.query, app.status_message)
             } else {
                 app.status_message.clone()
             }
@@ -123,7 +123,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Listing => {
             if app.ui.visual_mode {
                 "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
-            } else if app.search.results.is_some() {
+            } else if app.core.search.results.is_some() {
                 "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ q:Quit"
             } else {
                 "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ q:Quit"
@@ -156,7 +156,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = FilterCategory::all()
         .iter()
         .map(|cat| {
-            let style = if *cat == app.ui.selected_filter {
+            let style = if *cat == app.core.selected_filter {
                 Style::default().fg(Color::Yellow).bold()
             } else {
                 Style::default()
@@ -229,7 +229,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = app
-        .pkg.list
+        .core.list
         .iter()
         .enumerate()
         .map(|(idx, pkg)| {
@@ -283,7 +283,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .header(header)
         .block(
             Block::default()
-                .title(format!(" Packages ({}) ", app.pkg.list.len()))
+                .title(format!(" Packages ({}) ", app.core.list.len()))
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
@@ -292,12 +292,12 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(table, area, &mut app.ui.table_state);
 
-    if !app.pkg.list.is_empty() {
+    if !app.core.list.is_empty() {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
 
-        let mut scrollbar_state = ScrollbarState::new(app.pkg.list.len())
+        let mut scrollbar_state = ScrollbarState::new(app.core.list.len())
             .position(app.ui.table_state.selected().unwrap_or(0));
 
         let scrollbar_area = Rect {
@@ -504,7 +504,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
-    let preview = &app.pkg.mark_preview;
+    let preview = &app.core.mark_preview;
 
     // Build content first to calculate height
     let mut lines = vec![
@@ -623,76 +623,76 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
     ];
 
-    if !app.pkg.pending.to_upgrade.is_empty() {
+    if !app.core.pending.to_upgrade.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("UPGRADE ({}):", app.pkg.pending.to_upgrade.len()),
+            format!("UPGRADE ({}):", app.core.pending.to_upgrade.len()),
             Style::default().fg(Color::Yellow).bold(),
         )));
-        for name in &app.pkg.pending.to_upgrade {
+        for name in &app.core.pending.to_upgrade {
             lines.push(Line::from(format!("  ↑ {}", name)));
         }
         lines.push(Line::from(""));
     }
 
-    if !app.pkg.pending.to_install.is_empty() {
+    if !app.core.pending.to_install.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("INSTALL ({}):", app.pkg.pending.to_install.len()),
+            format!("INSTALL ({}):", app.core.pending.to_install.len()),
             Style::default().fg(Color::Green).bold(),
         )));
-        for name in &app.pkg.pending.to_install {
+        for name in &app.core.pending.to_install {
             lines.push(Line::from(format!("  + {}", name)));
         }
         lines.push(Line::from(""));
     }
 
-    if !app.pkg.pending.auto_upgrade.is_empty() {
+    if !app.core.pending.auto_upgrade.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
                 "AUTO-UPGRADE (dependencies) ({}):",
-                app.pkg.pending.auto_upgrade.len()
+                app.core.pending.auto_upgrade.len()
             ),
             Style::default().fg(Color::Cyan).bold(),
         )));
-        for name in &app.pkg.pending.auto_upgrade {
+        for name in &app.core.pending.auto_upgrade {
             lines.push(Line::from(format!("  ↑ {}", name)));
         }
         lines.push(Line::from(""));
     }
 
-    if !app.pkg.pending.auto_install.is_empty() {
+    if !app.core.pending.auto_install.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
                 "AUTO-INSTALL (dependencies) ({}):",
-                app.pkg.pending.auto_install.len()
+                app.core.pending.auto_install.len()
             ),
             Style::default().fg(Color::Cyan).bold(),
         )));
-        for name in &app.pkg.pending.auto_install {
+        for name in &app.core.pending.auto_install {
             lines.push(Line::from(format!("  + {}", name)));
         }
         lines.push(Line::from(""));
     }
 
-    if !app.pkg.pending.to_remove.is_empty() {
+    if !app.core.pending.to_remove.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("REMOVE ({}):", app.pkg.pending.to_remove.len()),
+            format!("REMOVE ({}):", app.core.pending.to_remove.len()),
             Style::default().fg(Color::Red).bold(),
         )));
-        for name in &app.pkg.pending.to_remove {
+        for name in &app.core.pending.to_remove {
             lines.push(Line::from(format!("  - {}", name)));
         }
         lines.push(Line::from(""));
     }
 
-    if !app.pkg.pending.auto_remove.is_empty() {
+    if !app.core.pending.auto_remove.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
                 "AUTO-REMOVE (no longer needed) ({}):",
-                app.pkg.pending.auto_remove.len()
+                app.core.pending.auto_remove.len()
             ),
             Style::default().fg(Color::Magenta).bold(),
         )));
-        for name in &app.pkg.pending.auto_remove {
+        for name in &app.core.pending.auto_remove {
             lines.push(Line::from(format!("  X {}", name)));
         }
         lines.push(Line::from(""));
@@ -701,18 +701,18 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
         "Download size: {}",
-        PackageInfo::size_str(app.pkg.pending.download_size)
+        PackageInfo::size_str(app.core.pending.download_size)
     )));
 
-    let size_change = if app.pkg.pending.install_size_change >= 0 {
+    let size_change = if app.core.pending.install_size_change >= 0 {
         format!(
             "+{}",
-            PackageInfo::size_str(app.pkg.pending.install_size_change as u64)
+            PackageInfo::size_str(app.core.pending.install_size_change as u64)
         )
     } else {
         format!(
             "-{}",
-            PackageInfo::size_str((-app.pkg.pending.install_size_change) as u64)
+            PackageInfo::size_str((-app.core.pending.install_size_change) as u64)
         )
     };
     lines.push(Line::from(format!("Disk space change: {}", size_change)));

@@ -1,5 +1,6 @@
 mod app;
 mod apt;
+mod core;
 mod search;
 mod types;
 mod ui;
@@ -51,10 +52,10 @@ fn main() -> Result<()> {
                             if app.ui.visual_mode {
                                 // Cancel visual mode
                                 app.cancel_visual_mode();
-                            } else if app.search.results.is_some() {
+                            } else if app.core.search.results.is_some() {
                                 // Clear search filter
-                                app.search.query.clear();
-                                app.search.results = None;
+                                app.core.search.query.clear();
+                                app.core.search.results = None;
                                 app.apply_current_filter();
                                 app.update_status_message();
                             }
@@ -131,11 +132,11 @@ fn main() -> Result<()> {
                         KeyCode::Esc => app.cancel_search(),
                         KeyCode::Enter => app.confirm_search(),
                         KeyCode::Backspace => {
-                            app.search.query.pop();
+                            app.core.search.query.pop();
                             app.execute_search();
                         }
                         KeyCode::Char(c) => {
-                            app.search.query.push(c);
+                            app.core.search.query.push(c);
                             app.execute_search();
                         }
                         _ => {}
