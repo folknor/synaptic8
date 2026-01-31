@@ -409,6 +409,10 @@ struct App {
     col_width_candidate: u16,
     // Sudo password input
     sudo_password: String,
+    // Multi-select (visual mode)
+    multi_select: HashSet<usize>,    // Indices of selected packages in current list
+    selection_anchor: Option<usize>, // Anchor point for range selection
+    visual_mode: bool,               // Whether visual selection mode is active
 }
 
 impl App {
@@ -450,6 +454,9 @@ impl App {
             col_width_installed: 9,
             col_width_candidate: 9,
             sudo_password: String::new(),
+            multi_select: HashSet::new(),
+            selection_anchor: None,
+            visual_mode: false,
         };
 
         app.reload_packages()?;
@@ -636,6 +643,9 @@ impl App {
 
     fn apply_current_filter(&mut self) {
         self.packages.clear();
+        self.multi_select.clear();
+        self.selection_anchor = None;
+        self.visual_mode = false;
 
         // Reset column widths to header minimums
         self.col_width_name = 7;      // "Package"
@@ -880,6 +890,100 @@ impl App {
                 // Marking - preview additional changes first
                 self.preview_mark(name);
             }
+        }
+    }
+
+    /// Start or extend visual selection mode
+    fn start_visual_mode(&mut self) {
+        let current_idx = self.table_state.selected().unwrap_or(0);
+
+        if !self.visual_mode {
+            // Start visual mode
+            self.visual_mode = true;
+            self.selection_anchor = Some(current_idx);
+            self.multi_select.clear();
+            self.multi_select.insert(current_idx);
+            self.status_message = "-- VISUAL -- (move to select, v/Space to mark, Esc to cancel)".to_string();
+        } else {
+            // Already in visual mode - mark selected and exit
+            self.mark_selected_packages();
+        }
+    }
+
+    /// Update visual selection when cursor moves
+    fn update_visual_selection(&mut self) {
+        if !self.visual_mode {
+            return;
+        }
+
+        let current_idx = self.table_state.selected().unwrap_or(0);
+        if let Some(anchor) = self.selection_anchor {
+            let start = anchor.min(current_idx);
+            let end = anchor.max(current_idx);
+
+            self.multi_select.clear();
+            for idx in start..=end {
+                self.multi_select.insert(idx);
+            }
+        }
+    }
+
+    /// Cancel visual mode without marking
+    fn cancel_visual_mode(&mut self) {
+        self.visual_mode = false;
+        self.multi_select.clear();
+        self.selection_anchor = None;
+        self.update_status_message();
+    }
+
+    /// Handle Shift+Space for multi-select (alternative to 'v')
+    fn toggle_multi_select(&mut self) {
+        if !self.visual_mode {
+            // Start visual mode
+            self.start_visual_mode();
+        } else {
+            // Complete selection and mark
+            self.mark_selected_packages();
+        }
+    }
+
+    /// Mark all multi-selected packages for install/upgrade
+    fn mark_selected_packages(&mut self) {
+        // Collect package names to mark
+        let packages_to_mark: Vec<String> = self.multi_select.iter()
+            .filter_map(|&idx| self.packages.get(idx))
+            .map(|p| p.name.clone())
+            .collect();
+
+        // Mark each package
+        for name in &packages_to_mark {
+            if let Some(pkg) = self.cache.get(name) {
+                if pkg.is_upgradable() || !pkg.is_installed() {
+                    pkg.mark_install(true, true);
+                    pkg.protect();
+                    self.user_marked.insert(name.clone(), true);
+                }
+            }
+        }
+
+        // Resolve dependencies
+        if let Err(e) = self.cache.resolve(true) {
+            self.status_message = format!("Dependency error: {}", e);
+        }
+
+        // Clear selection and exit visual mode
+        self.multi_select.clear();
+        self.selection_anchor = None;
+        self.visual_mode = false;
+
+        // Update state
+        self.calculate_pending_changes();
+        self.apply_current_filter();
+        self.update_status_message();
+
+        // Show changes preview if there are pending changes
+        if self.has_pending_changes() {
+            self.show_changes_preview();
         }
     }
 
@@ -1342,8 +1446,11 @@ fn main() -> Result<()> {
                         KeyCode::BackTab => app.cycle_focus_back(),
                         KeyCode::Char('/') => app.start_search(),
                         KeyCode::Esc => {
-                            // Clear search filter
-                            if app.search_results.is_some() {
+                            if app.visual_mode {
+                                // Cancel visual mode
+                                app.cancel_visual_mode();
+                            } else if app.search_results.is_some() {
+                                // Clear search filter
                                 app.search_query.clear();
                                 app.search_results = None;
                                 app.apply_current_filter();
@@ -1352,23 +1459,51 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Up | KeyCode::Char('k') => match app.focused_pane {
                             FocusedPane::Filters => app.move_filter_selection(-1),
-                            FocusedPane::Packages => app.move_package_selection(-1),
+                            FocusedPane::Packages => {
+                                app.move_package_selection(-1);
+                                app.update_visual_selection();
+                            }
                             FocusedPane::Details => {
                                 app.detail_scroll = app.detail_scroll.saturating_sub(1)
                             }
                         },
                         KeyCode::Down | KeyCode::Char('j') => match app.focused_pane {
                             FocusedPane::Filters => app.move_filter_selection(1),
-                            FocusedPane::Packages => app.move_package_selection(1),
+                            FocusedPane::Packages => {
+                                app.move_package_selection(1);
+                                app.update_visual_selection();
+                            }
                             FocusedPane::Details => {
                                 app.detail_scroll = app.detail_scroll.saturating_add(1)
                             }
                         },
-                        KeyCode::PageDown => app.move_package_selection(10),
-                        KeyCode::PageUp => app.move_package_selection(-10),
+                        KeyCode::PageDown => {
+                            app.move_package_selection(10);
+                            app.update_visual_selection();
+                        }
+                        KeyCode::PageUp => {
+                            app.move_package_selection(-10);
+                            app.update_visual_selection();
+                        }
+                        KeyCode::Char('v') => {
+                            if app.focused_pane == FocusedPane::Packages {
+                                app.start_visual_mode();
+                            }
+                        }
+                        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            if app.focused_pane == FocusedPane::Packages {
+                                app.toggle_multi_select();
+                            }
+                        }
                         KeyCode::Char(' ') => {
                             if app.focused_pane == FocusedPane::Packages {
-                                app.toggle_current();
+                                if app.visual_mode {
+                                    // In visual mode, Space marks all selected
+                                    app.mark_selected_packages();
+                                } else {
+                                    // Normal mode - mark single package
+                                    app.toggle_current();
+                                }
                             }
                         }
                         KeyCode::Left | KeyCode::Char('h') => {
@@ -1405,7 +1540,14 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Up => app.move_package_selection(-1),
                         KeyCode::Down => app.move_package_selection(1),
-                        KeyCode::Char(' ') => app.toggle_current(),
+                        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            app.toggle_multi_select();
+                        }
+                        KeyCode::Char(' ') => {
+                            app.multi_select.clear();
+                            app.selection_anchor = None;
+                            app.toggle_current();
+                        }
                         KeyCode::Char(c) => {
                             app.search_query.push(c);
                             app.execute_search();
@@ -1668,10 +1810,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     let help_text = match app.state {
         AppState::Listing => {
-            if app.search_results.is_some() {
-                "/:Search │ Esc:Clear │ Space:Mark │ x:All │ N:None │ d:Deps │ u:Apply │ q:Quit"
+            if app.visual_mode {
+                "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
+            } else if app.search_results.is_some() {
+                "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ r:Refresh │ q:Quit"
+                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ u:Apply │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
@@ -1776,7 +1920,10 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = app
         .packages
         .iter()
-        .map(|pkg| {
+        .enumerate()
+        .map(|(idx, pkg)| {
+            let is_multi_selected = app.multi_select.contains(&idx);
+
             let cells: Vec<Cell> = visible_cols
                 .iter()
                 .map(|col| match col {
@@ -1804,7 +1951,12 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 })
                 .collect();
 
-            Row::new(cells)
+            let row = Row::new(cells);
+            if is_multi_selected {
+                row.style(Style::default().bg(Color::Blue))
+            } else {
+                row
+            }
         })
         .collect();
 
