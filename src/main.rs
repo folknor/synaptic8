@@ -45,35 +45,35 @@ fn main() -> Result<()> {
                         KeyCode::BackTab => app.cycle_focus_back(),
                         KeyCode::Char('/') => app.start_search(),
                         KeyCode::Esc => {
-                            if app.visual_mode {
+                            if app.ui.visual_mode {
                                 // Cancel visual mode
                                 app.cancel_visual_mode();
-                            } else if app.search_results.is_some() {
+                            } else if app.search.results.is_some() {
                                 // Clear search filter
-                                app.search_query.clear();
-                                app.search_results = None;
+                                app.search.query.clear();
+                                app.search.results = None;
                                 app.apply_current_filter();
                                 app.update_status_message();
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') => match app.focused_pane {
+                        KeyCode::Up | KeyCode::Char('k') => match app.ui.focused_pane {
                             FocusedPane::Filters => app.move_filter_selection(-1),
                             FocusedPane::Packages => {
                                 app.move_package_selection(-1);
                                 app.update_visual_selection();
                             }
                             FocusedPane::Details => {
-                                app.detail_scroll = app.detail_scroll.saturating_sub(1)
+                                app.details.scroll = app.details.scroll.saturating_sub(1)
                             }
                         },
-                        KeyCode::Down | KeyCode::Char('j') => match app.focused_pane {
+                        KeyCode::Down | KeyCode::Char('j') => match app.ui.focused_pane {
                             FocusedPane::Filters => app.move_filter_selection(1),
                             FocusedPane::Packages => {
                                 app.move_package_selection(1);
                                 app.update_visual_selection();
                             }
                             FocusedPane::Details => {
-                                app.detail_scroll = app.detail_scroll.saturating_add(1)
+                                app.details.scroll = app.details.scroll.saturating_add(1)
                             }
                         },
                         KeyCode::PageDown => {
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
                             app.update_visual_selection();
                         }
                         KeyCode::Char(' ') => {
-                            if app.visual_mode {
+                            if app.ui.visual_mode {
                                 app.toggle_multi_select();
                             } else {
                                 app.toggle_current();
@@ -128,11 +128,11 @@ fn main() -> Result<()> {
                         KeyCode::Esc => app.cancel_search(),
                         KeyCode::Enter => app.confirm_search(),
                         KeyCode::Backspace => {
-                            app.search_query.pop();
+                            app.search.query.pop();
                             app.execute_search();
                         }
                         KeyCode::Char(c) => {
-                            app.search_query.push(c);
+                            app.search.query.push(c);
                             app.execute_search();
                         }
                         _ => {}

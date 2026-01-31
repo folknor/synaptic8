@@ -11,48 +11,82 @@ use rust_apt::{Package, Version};
 use crate::search::SearchIndex;
 use crate::types::*;
 
-pub struct App {
+/// Package management state - APT cache and marking state
+pub struct PackageState {
     pub cache: Cache,
-    pub packages: Vec<PackageInfo>,
+    pub list: Vec<PackageInfo>,
     pub user_marked: HashMap<String, bool>,
+    pub pending: PendingChanges,
+    pub mark_preview: MarkPreview,
+    pub upgradable_count: usize,
+}
+
+/// UI widget state for the main views
+pub struct UiState {
     pub table_state: TableState,
     pub filter_state: ListState,
-    pub state: AppState,
-    pub status_message: String,
-    pub output_lines: Vec<String>,
     pub focused_pane: FocusedPane,
     pub selected_filter: FilterCategory,
-    pub detail_scroll: u16,
-    pub details_tab: DetailsTab,
-    pub pending_changes: PendingChanges,
-    pub changes_scroll: u16,
-    pub mark_preview: MarkPreview, // Preview of additional changes when marking
-    pub mark_confirm_scroll: u16,
-    // Search
-    pub search_index: Option<SearchIndex>,
-    pub search_query: String,
-    pub search_results: Option<HashSet<String>>, // None = no active search filter
-    pub search_build_time: Option<std::time::Duration>,
-    // Settings
-    pub settings: Settings,
-    pub settings_selection: usize,
-    // Changelog
-    pub changelog_content: Vec<String>,
-    pub changelog_scroll: u16,
-    // Cached dependencies for current selection (avoid recalc every frame)
+    pub multi_select: HashSet<usize>,
+    pub selection_anchor: Option<usize>,
+    pub visual_mode: bool,
+}
+
+/// Details pane state and cached data
+pub struct DetailsState {
+    pub scroll: u16,
+    pub tab: DetailsTab,
     pub cached_deps: Vec<(String, String)>,
     pub cached_rdeps: Vec<(String, String)>,
     pub cached_pkg_name: String,
-    // Column widths (calculated from content)
+}
+
+impl Default for DetailsState {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            tab: DetailsTab::Info,
+            cached_deps: Vec::new(),
+            cached_rdeps: Vec::new(),
+            cached_pkg_name: String::new(),
+        }
+    }
+}
+
+/// Full-text search state
+#[derive(Default)]
+pub struct SearchState {
+    pub index: Option<SearchIndex>,
+    pub query: String,
+    pub results: Option<HashSet<String>>,
+    pub build_time: Option<std::time::Duration>,
+}
+
+/// Modal/popup scroll positions and content
+#[derive(Default)]
+pub struct ModalState {
+    pub mark_confirm_scroll: u16,
+    pub changes_scroll: u16,
+    pub changelog_scroll: u16,
+    pub changelog_content: Vec<String>,
+}
+
+pub struct App {
+    // Grouped state
+    pub pkg: PackageState,
+    pub ui: UiState,
+    pub details: DetailsState,
+    pub search: SearchState,
+    pub modals: ModalState,
+
+    // Global state
+    pub state: AppState,
+    pub settings: Settings,
+    pub settings_selection: usize,
     pub col_widths: ColumnWidths,
-    // Sudo password input
+    pub status_message: String,
+    pub output_lines: Vec<String>,
     pub sudo_password: String,
-    // Multi-select (visual mode)
-    pub multi_select: HashSet<usize>,    // Indices of selected packages in current list
-    pub selection_anchor: Option<usize>, // Anchor point for range selection
-    pub visual_mode: bool,               // Whether visual selection mode is active
-    // Cached counts (avoid iterating all packages repeatedly)
-    pub upgradable_count: usize,
 }
 
 impl App {
@@ -62,39 +96,33 @@ impl App {
         filter_state.select(Some(0));
 
         let mut app = Self {
-            cache,
-            packages: Vec::new(),
-            user_marked: HashMap::new(),
-            table_state: TableState::default(),
-            filter_state,
+            pkg: PackageState {
+                cache,
+                list: Vec::new(),
+                user_marked: HashMap::new(),
+                pending: PendingChanges::default(),
+                mark_preview: MarkPreview::default(),
+                upgradable_count: 0,
+            },
+            ui: UiState {
+                table_state: TableState::default(),
+                filter_state,
+                focused_pane: FocusedPane::Packages,
+                selected_filter: FilterCategory::Upgradable,
+                multi_select: HashSet::new(),
+                selection_anchor: None,
+                visual_mode: false,
+            },
+            details: DetailsState::default(),
+            search: SearchState::default(),
+            modals: ModalState::default(),
             state: AppState::Listing,
-            status_message: String::from("Loading..."),
-            output_lines: Vec::new(),
-            focused_pane: FocusedPane::Packages,
-            selected_filter: FilterCategory::Upgradable,
-            detail_scroll: 0,
-            details_tab: DetailsTab::Info,
-            pending_changes: PendingChanges::default(),
-            changes_scroll: 0,
-            mark_preview: MarkPreview::default(),
-            mark_confirm_scroll: 0,
-            search_index: None,
-            search_query: String::new(),
-            search_results: None,
-            search_build_time: None,
             settings: Settings::default(),
             settings_selection: 0,
-            changelog_content: Vec::new(),
-            changelog_scroll: 0,
-            cached_deps: Vec::new(),
-            cached_rdeps: Vec::new(),
-            cached_pkg_name: String::new(),
             col_widths: ColumnWidths::new(),
+            status_message: String::from("Loading..."),
+            output_lines: Vec::new(),
             sudo_password: String::new(),
-            multi_select: HashSet::new(),
-            selection_anchor: None,
-            visual_mode: false,
-            upgradable_count: 0,
         };
 
         app.update_upgradable_count();
@@ -109,16 +137,16 @@ impl App {
             .unwrap_or_default();
 
         // Only recalculate if selection changed
-        if pkg_name == self.cached_pkg_name {
+        if pkg_name == self.details.cached_pkg_name {
             return;
         }
-        self.cached_pkg_name = pkg_name.clone();
+        self.details.cached_pkg_name = pkg_name.clone();
 
         // Clear and recalculate deps
-        self.cached_deps.clear();
-        self.cached_rdeps.clear();
+        self.details.cached_deps.clear();
+        self.details.cached_rdeps.clear();
 
-        let pkg = match self.cache.get(&pkg_name) {
+        let pkg = match self.pkg.cache.get(&pkg_name) {
             Some(p) => p,
             None => return,
         };
@@ -129,7 +157,7 @@ impl App {
                 for dep in dependencies {
                     let dep_type = dep.dep_type().to_string();
                     for base_dep in dep.iter() {
-                        self.cached_deps.push((dep_type.clone(), base_dep.name().to_string()));
+                        self.details.cached_deps.push((dep_type.clone(), base_dep.name().to_string()));
                     }
                 }
             }
@@ -146,7 +174,7 @@ impl App {
                 _ => 5,
             }
         }
-        self.cached_deps.sort_by(|a, b| {
+        self.details.cached_deps.sort_by(|a, b| {
             dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -157,12 +185,12 @@ impl App {
             let type_str = format!("{:?}", dep_type);
             for dep in deps {
                 for base_dep in dep.iter() {
-                    self.cached_rdeps.push((type_str.clone(), base_dep.name().to_string()));
+                    self.details.cached_rdeps.push((type_str.clone(), base_dep.name().to_string()));
                 }
             }
         }
         // Sort rdeps by type priority, then by name
-        self.cached_rdeps.sort_by(|a, b| {
+        self.details.cached_rdeps.sort_by(|a, b| {
             dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -170,20 +198,20 @@ impl App {
 
     /// Get status for a package by name (for dep views)
     pub fn get_package_status(&self, name: &str) -> PackageStatus {
-        match self.cache.get(name) {
+        match self.pkg.cache.get(name) {
             Some(pkg) => {
                 if pkg.marked_upgrade() {
                     PackageStatus::Upgrade
                 } else if pkg.marked_install() {
                     if pkg.is_installed() {
                         PackageStatus::Upgrade
-                    } else if self.user_marked.get(name).copied().unwrap_or(false) {
+                    } else if self.pkg.user_marked.get(name).copied().unwrap_or(false) {
                         PackageStatus::Install
                     } else {
                         PackageStatus::AutoInstall
                     }
                 } else if pkg.marked_delete() {
-                    if self.user_marked.get(name).copied().unwrap_or(false) {
+                    if self.pkg.user_marked.get(name).copied().unwrap_or(false) {
                         PackageStatus::Remove
                     } else {
                         PackageStatus::AutoRemove
@@ -203,16 +231,16 @@ impl App {
     }
 
     pub fn ensure_search_index(&mut self) -> Result<()> {
-        if self.search_index.is_none() {
+        if self.search.index.is_none() {
             let mut index = SearchIndex::new()?;
-            let (count, duration) = index.build(&self.cache)?;
-            self.search_build_time = Some(duration);
+            let (count, duration) = index.build(&self.pkg.cache)?;
+            self.search.build_time = Some(duration);
             self.status_message = format!(
                 "Search index built: {} packages in {:.0}ms",
                 count,
                 duration.as_secs_f64() * 1000.0
             );
-            self.search_index = Some(index);
+            self.search.index = Some(index);
         }
         Ok(())
     }
@@ -222,26 +250,26 @@ impl App {
             self.status_message = format!("Failed to build search index: {}", e);
             return;
         }
-        self.search_query.clear();
+        self.search.query.clear();
         self.state = AppState::Searching;
     }
 
     pub fn execute_search(&mut self) {
-        if self.search_query.is_empty() {
-            self.search_results = None;
-        } else if let Some(ref index) = self.search_index {
-            match index.search(&self.search_query) {
+        if self.search.query.is_empty() {
+            self.search.results = None;
+        } else if let Some(ref index) = self.search.index {
+            match index.search(&self.search.query) {
                 Ok(results) => {
-                    self.search_results = Some(results);
+                    self.search.results = Some(results);
                 }
                 Err(e) => {
                     self.status_message = format!("Search error: {}", e);
-                    self.search_results = None;
+                    self.search.results = None;
                 }
             }
         }
         self.apply_current_filter();
-        self.table_state.select(if self.packages.is_empty() {
+        self.ui.table_state.select(if self.pkg.list.is_empty() {
             None
         } else {
             Some(0)
@@ -249,8 +277,8 @@ impl App {
     }
 
     pub fn cancel_search(&mut self) {
-        self.search_query.clear();
-        self.search_results = None;
+        self.search.query.clear();
+        self.search.results = None;
         self.state = AppState::Listing;
         self.apply_current_filter();
         self.update_status_message();
@@ -259,21 +287,21 @@ impl App {
     pub fn confirm_search(&mut self) {
         self.execute_search();
         self.state = AppState::Listing;
-        if let Some(ref results) = self.search_results {
+        if let Some(ref results) = self.search.results {
             self.status_message = format!(
                 "Found {} packages matching '{}'",
                 results.len(),
-                self.search_query
+                self.search.query
             );
         }
     }
 
     pub fn reload_packages(&mut self) -> Result<()> {
-        self.packages.clear();
+        self.pkg.list.clear();
         self.apply_current_filter();
 
-        if !self.packages.is_empty() {
-            self.table_state.select(Some(0));
+        if !self.pkg.list.is_empty() {
+            self.ui.table_state.select(Some(0));
         }
 
         self.update_cached_deps();
@@ -282,23 +310,23 @@ impl App {
     }
 
     pub fn apply_current_filter(&mut self) {
-        self.packages.clear();
-        self.multi_select.clear();
-        self.selection_anchor = None;
-        self.visual_mode = false;
+        self.pkg.list.clear();
+        self.ui.multi_select.clear();
+        self.ui.selection_anchor = None;
+        self.ui.visual_mode = false;
 
         // Reset column widths to header minimums
         self.col_widths.reset();
 
-        let sort = if self.selected_filter == FilterCategory::Upgradable {
+        let sort = if self.ui.selected_filter == FilterCategory::Upgradable {
             PackageSort::default().upgradable()
         } else {
             PackageSort::default()
         };
 
-        for pkg in self.cache.packages(&sort) {
+        for pkg in self.pkg.cache.packages(&sort) {
             // Apply category filter
-            let matches_category = match self.selected_filter {
+            let matches_category = match self.ui.selected_filter {
                 FilterCategory::Upgradable => pkg.is_upgradable(),
                 FilterCategory::MarkedChanges => {
                     pkg.marked_install() || pkg.marked_delete() || pkg.marked_upgrade()
@@ -309,7 +337,7 @@ impl App {
             };
 
             // Apply search filter if active
-            let matches_search = match &self.search_results {
+            let matches_search = match &self.search.results {
                 Some(results) => results.contains(pkg.name()),
                 None => true,
             };
@@ -321,7 +349,7 @@ impl App {
                     self.col_widths.section = self.col_widths.section.max(info.section.len() as u16);
                     self.col_widths.installed = self.col_widths.installed.max(info.installed_version.len() as u16);
                     self.col_widths.candidate = self.col_widths.candidate.max(info.candidate_version.len() as u16);
-                    self.packages.push(info);
+                    self.pkg.list.push(info);
                 }
             }
         }
@@ -336,7 +364,7 @@ impl App {
             };
             if self.settings.sort_ascending { ord } else { ord.reverse() }
         };
-        self.packages.sort_by(cmp);
+        self.pkg.list.sort_by(cmp);
     }
 
     fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
@@ -349,13 +377,13 @@ impl App {
             if pkg.is_installed() {
                 // Installed package marked for install = upgrade
                 PackageStatus::Upgrade
-            } else if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
+            } else if self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false) {
                 PackageStatus::Install
             } else {
                 PackageStatus::AutoInstall
             }
         } else if pkg.marked_delete() {
-            if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
+            if self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false) {
                 PackageStatus::Remove
             } else {
                 PackageStatus::AutoRemove
@@ -392,32 +420,32 @@ impl App {
             download_size,
             description,
             architecture,
-            is_user_marked: self.user_marked.get(pkg.name()).copied().unwrap_or(false),
+            is_user_marked: self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false),
         })
     }
 
     pub fn selected_package(&self) -> Option<&PackageInfo> {
-        self.table_state
+        self.ui.table_state
             .selected()
-            .and_then(|i| self.packages.get(i))
+            .and_then(|i| self.pkg.list.get(i))
     }
 
     pub fn next_details_tab(&mut self) {
-        self.details_tab = match self.details_tab {
+        self.details.tab = match self.details.tab {
             DetailsTab::Info => DetailsTab::Dependencies,
             DetailsTab::Dependencies => DetailsTab::ReverseDeps,
             DetailsTab::ReverseDeps => DetailsTab::Info,
         };
-        self.detail_scroll = 0;
+        self.details.scroll = 0;
     }
 
     pub fn prev_details_tab(&mut self) {
-        self.details_tab = match self.details_tab {
+        self.details.tab = match self.details.tab {
             DetailsTab::Info => DetailsTab::ReverseDeps,
             DetailsTab::Dependencies => DetailsTab::Info,
             DetailsTab::ReverseDeps => DetailsTab::Dependencies,
         };
-        self.detail_scroll = 0;
+        self.details.scroll = 0;
     }
 
     pub fn show_changelog(&mut self) {
@@ -429,9 +457,9 @@ impl App {
             }
         };
 
-        self.changelog_content.clear();
-        self.changelog_content.push(format!("Loading changelog for {}...", pkg_name));
-        self.changelog_scroll = 0;
+        self.modals.changelog_content.clear();
+        self.modals.changelog_content.push(format!("Loading changelog for {}...", pkg_name));
+        self.modals.changelog_scroll = 0;
 
         // Run apt changelog command
         match std::process::Command::new("apt")
@@ -439,23 +467,23 @@ impl App {
             .output()
         {
             Ok(output) => {
-                self.changelog_content.clear();
+                self.modals.changelog_content.clear();
                 if output.status.success() {
                     let content = String::from_utf8_lossy(&output.stdout);
                     for line in content.lines() {
-                        self.changelog_content.push(line.to_string());
+                        self.modals.changelog_content.push(line.to_string());
                     }
-                    if self.changelog_content.is_empty() {
-                        self.changelog_content.push("No changelog available.".to_string());
+                    if self.modals.changelog_content.is_empty() {
+                        self.modals.changelog_content.push("No changelog available.".to_string());
                     }
                 } else {
                     let err = String::from_utf8_lossy(&output.stderr);
-                    self.changelog_content.push(format!("Error: {}", err));
+                    self.modals.changelog_content.push(format!("Error: {}", err));
                 }
             }
             Err(e) => {
-                self.changelog_content.clear();
-                self.changelog_content.push(format!("Failed to run apt changelog: {}", e));
+                self.modals.changelog_content.clear();
+                self.modals.changelog_content.push(format!("Failed to run apt changelog: {}", e));
             }
         }
 
@@ -495,8 +523,8 @@ impl App {
     }
 
     pub fn toggle_current(&mut self) {
-        if let Some(i) = self.table_state.selected() {
-            if let Some(pkg_info) = self.packages.get(i) {
+        if let Some(i) = self.ui.table_state.selected() {
+            if let Some(pkg_info) = self.pkg.list.get(i) {
                 let pkg_name = pkg_info.name.clone();
                 self.toggle_package(&pkg_name);
             }
@@ -504,15 +532,15 @@ impl App {
     }
 
     fn toggle_package(&mut self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
+        if let Some(pkg) = self.pkg.cache.get(name) {
             let currently_marked = pkg.marked_install() || pkg.marked_upgrade();
 
             if currently_marked {
                 // Unmarking - just do it directly (no confirmation needed)
                 pkg.mark_keep();
-                self.user_marked.remove(name);
+                self.pkg.user_marked.remove(name);
 
-                if let Err(e) = self.cache.resolve(true) {
+                if let Err(e) = self.pkg.cache.resolve(true) {
                     self.status_message = format!("Dependency error: {}", e);
                 }
 
@@ -528,14 +556,14 @@ impl App {
 
     /// Start or extend visual selection mode
     pub fn start_visual_mode(&mut self) {
-        let current_idx = self.table_state.selected().unwrap_or(0);
+        let current_idx = self.ui.table_state.selected().unwrap_or(0);
 
-        if !self.visual_mode {
+        if !self.ui.visual_mode {
             // Start visual mode
-            self.visual_mode = true;
-            self.selection_anchor = Some(current_idx);
-            self.multi_select.clear();
-            self.multi_select.insert(current_idx);
+            self.ui.visual_mode = true;
+            self.ui.selection_anchor = Some(current_idx);
+            self.ui.multi_select.clear();
+            self.ui.multi_select.insert(current_idx);
             self.status_message = "-- VISUAL -- (move to select, v/Space to mark, Esc to cancel)".to_string();
         } else {
             // Already in visual mode - mark selected and exit
@@ -545,33 +573,33 @@ impl App {
 
     /// Update visual selection when cursor moves
     pub fn update_visual_selection(&mut self) {
-        if !self.visual_mode {
+        if !self.ui.visual_mode {
             return;
         }
 
-        let current_idx = self.table_state.selected().unwrap_or(0);
-        if let Some(anchor) = self.selection_anchor {
+        let current_idx = self.ui.table_state.selected().unwrap_or(0);
+        if let Some(anchor) = self.ui.selection_anchor {
             let start = anchor.min(current_idx);
             let end = anchor.max(current_idx);
 
-            self.multi_select.clear();
+            self.ui.multi_select.clear();
             for idx in start..=end {
-                self.multi_select.insert(idx);
+                self.ui.multi_select.insert(idx);
             }
         }
     }
 
     /// Cancel visual mode without marking
     pub fn cancel_visual_mode(&mut self) {
-        self.visual_mode = false;
-        self.multi_select.clear();
-        self.selection_anchor = None;
+        self.ui.visual_mode = false;
+        self.ui.multi_select.clear();
+        self.ui.selection_anchor = None;
         self.update_status_message();
     }
 
     /// Handle Shift+Space for multi-select (alternative to 'v')
     pub fn toggle_multi_select(&mut self) {
-        if !self.visual_mode {
+        if !self.ui.visual_mode {
             // Start visual mode
             self.start_visual_mode();
         } else {
@@ -583,31 +611,31 @@ impl App {
     /// Mark all multi-selected packages for install/upgrade
     fn mark_selected_packages(&mut self) {
         // Collect package names to mark
-        let packages_to_mark: Vec<String> = self.multi_select.iter()
-            .filter_map(|&idx| self.packages.get(idx))
+        let packages_to_mark: Vec<String> = self.ui.multi_select.iter()
+            .filter_map(|&idx| self.pkg.list.get(idx))
             .map(|p| p.name.clone())
             .collect();
 
         // Mark each package
         for name in &packages_to_mark {
-            if let Some(pkg) = self.cache.get(name) {
+            if let Some(pkg) = self.pkg.cache.get(name) {
                 if pkg.is_upgradable() || !pkg.is_installed() {
                     pkg.mark_install(true, true);
                     pkg.protect();
-                    self.user_marked.insert(name.clone(), true);
+                    self.pkg.user_marked.insert(name.clone(), true);
                 }
             }
         }
 
         // Resolve dependencies
-        if let Err(e) = self.cache.resolve(true) {
+        if let Err(e) = self.pkg.cache.resolve(true) {
             self.status_message = format!("Dependency error: {}", e);
         }
 
         // Clear selection and exit visual mode
-        self.multi_select.clear();
-        self.selection_anchor = None;
-        self.visual_mode = false;
+        self.ui.multi_select.clear();
+        self.ui.selection_anchor = None;
+        self.ui.visual_mode = false;
 
         // Update state
         self.calculate_pending_changes();
@@ -625,19 +653,19 @@ impl App {
     fn preview_mark(&mut self, name: &str) {
         // Get current state of all packages before marking
         let before: std::collections::HashSet<String> = self
-            .cache
+            .pkg.cache
             .get_changes(false)
             .map(|p| p.name().to_string())
             .collect();
 
         // Temporarily mark the package to see what would happen
-        if let Some(pkg) = self.cache.get(name) {
+        if let Some(pkg) = self.pkg.cache.get(name) {
             pkg.mark_install(true, true);
             pkg.protect();
         }
 
         // Resolve dependencies
-        if let Err(e) = self.cache.resolve(true) {
+        if let Err(e) = self.pkg.cache.resolve(true) {
             self.status_message = format!("Dependency error: {}", e);
             // Undo and return
             self.restore_marks();
@@ -650,7 +678,7 @@ impl App {
         let mut additional_removes = Vec::new();
         let mut download_size: u64 = 0;
 
-        for pkg in self.cache.get_changes(false) {
+        for pkg in self.pkg.cache.get_changes(false) {
             let pkg_name = pkg.name().to_string();
 
             // Skip the package we're marking
@@ -685,7 +713,7 @@ impl App {
 
         // If there are additional changes, show the confirmation popup
         if !additional_installs.is_empty() || !additional_upgrades.is_empty() || !additional_removes.is_empty() {
-            self.mark_preview = MarkPreview {
+            self.pkg.mark_preview = MarkPreview {
                 package_name: name.to_string(),
                 is_marking: true,
                 additional_installs,
@@ -693,11 +721,11 @@ impl App {
                 additional_removes,
                 download_size,
             };
-            self.mark_confirm_scroll = 0;
+            self.modals.mark_confirm_scroll = 0;
             self.state = AppState::ShowingMarkConfirm;
         } else {
             // No additional changes, just apply directly
-            self.mark_preview = MarkPreview {
+            self.pkg.mark_preview = MarkPreview {
                 package_name: name.to_string(),
                 is_marking: true,
                 additional_installs: Vec::new(),
@@ -713,20 +741,20 @@ impl App {
     fn restore_marks(&mut self) {
         // Nuclear option: reload cache to guarantee clean state
         if let Ok(new_cache) = Cache::new::<&str>(&[]) {
-            self.cache = new_cache;
+            self.pkg.cache = new_cache;
         }
 
         // Re-apply only user-marked packages
-        for name in self.user_marked.keys() {
-            if let Some(pkg) = self.cache.get(name) {
+        for name in self.pkg.user_marked.keys() {
+            if let Some(pkg) = self.pkg.cache.get(name) {
                 pkg.mark_install(true, true);
                 pkg.protect();
             }
         }
 
         // Resolve dependencies
-        if !self.user_marked.is_empty() {
-            if let Err(e) = self.cache.resolve(true) {
+        if !self.pkg.user_marked.is_empty() {
+            if let Err(e) = self.pkg.cache.resolve(true) {
                 self.status_message = format!("Warning: dependency resolution issue: {}", e);
             }
         }
@@ -734,21 +762,21 @@ impl App {
 
     /// User confirmed the mark, now actually apply it
     pub fn confirm_mark(&mut self) {
-        let name = self.mark_preview.package_name.clone();
+        let name = self.pkg.mark_preview.package_name.clone();
 
         // Now actually apply the mark
-        if let Some(pkg) = self.cache.get(&name) {
+        if let Some(pkg) = self.pkg.cache.get(&name) {
             pkg.mark_install(true, true);
             pkg.protect();
         }
-        if let Err(e) = self.cache.resolve(true) {
+        if let Err(e) = self.pkg.cache.resolve(true) {
             self.status_message = format!("Warning: dependency resolution issue: {}", e);
         }
 
         // Record in user_marked
-        self.user_marked.insert(name, true);
+        self.pkg.user_marked.insert(name, true);
 
-        self.mark_preview = MarkPreview::default();
+        self.pkg.mark_preview = MarkPreview::default();
         self.calculate_pending_changes();
         self.apply_current_filter();
         self.update_status_message();
@@ -757,22 +785,22 @@ impl App {
 
     /// User cancelled the mark - nothing to undo since we didn't apply yet
     pub fn cancel_mark(&mut self) {
-        self.mark_preview = MarkPreview::default();
+        self.pkg.mark_preview = MarkPreview::default();
         self.calculate_pending_changes();
         self.update_status_message();
         self.state = AppState::Listing;
     }
 
     pub fn mark_all_upgrades(&mut self) {
-        for pkg in self.cache.packages(&PackageSort::default()) {
+        for pkg in self.pkg.cache.packages(&PackageSort::default()) {
             if pkg.is_upgradable() {
                 pkg.mark_install(true, true);
                 pkg.protect();
-                self.user_marked.insert(pkg.name().to_string(), true);
+                self.pkg.user_marked.insert(pkg.name().to_string(), true);
             }
         }
 
-        if let Err(e) = self.cache.resolve(true) {
+        if let Err(e) = self.pkg.cache.resolve(true) {
             self.status_message = format!("Dependency error: {}", e);
         }
 
@@ -785,10 +813,10 @@ impl App {
     }
 
     pub fn unmark_all(&mut self) {
-        for pkg in self.cache.packages(&PackageSort::default()) {
+        for pkg in self.pkg.cache.packages(&PackageSort::default()) {
             pkg.mark_keep();
         }
-        self.user_marked.clear();
+        self.pkg.user_marked.clear();
 
         self.calculate_pending_changes();
         self.apply_current_filter();
@@ -796,40 +824,40 @@ impl App {
     }
 
     pub fn calculate_pending_changes(&mut self) {
-        self.pending_changes = PendingChanges::default();
+        self.pkg.pending = PendingChanges::default();
 
-        for pkg in self.cache.get_changes(false) {
+        for pkg in self.pkg.cache.get_changes(false) {
             let name = pkg.name().to_string();
-            let is_user = self.user_marked.get(&name).copied().unwrap_or(false);
+            let is_user = self.pkg.user_marked.get(&name).copied().unwrap_or(false);
 
             if pkg.marked_install() {
                 if pkg.is_installed() {
                     if is_user {
-                        self.pending_changes.to_upgrade.push(name);
+                        self.pkg.pending.to_upgrade.push(name);
                     } else {
-                        self.pending_changes.auto_upgrade.push(name);
+                        self.pkg.pending.auto_upgrade.push(name);
                     }
                 } else {
                     if is_user {
-                        self.pending_changes.to_install.push(name);
+                        self.pkg.pending.to_install.push(name);
                     } else {
-                        self.pending_changes.auto_install.push(name);
+                        self.pkg.pending.auto_install.push(name);
                     }
                 }
 
                 if let Some(cand) = pkg.candidate() {
-                    self.pending_changes.download_size += cand.size();
-                    self.pending_changes.install_size_change += cand.installed_size() as i64;
+                    self.pkg.pending.download_size += cand.size();
+                    self.pkg.pending.install_size_change += cand.installed_size() as i64;
                 }
             } else if pkg.marked_delete() {
                 if is_user {
-                    self.pending_changes.to_remove.push(name);
+                    self.pkg.pending.to_remove.push(name);
                 } else {
-                    self.pending_changes.auto_remove.push(name);
+                    self.pkg.pending.auto_remove.push(name);
                 }
 
                 if let Some(inst) = pkg.installed() {
-                    self.pending_changes.install_size_change -= inst.installed_size() as i64;
+                    self.pkg.pending.install_size_change -= inst.installed_size() as i64;
                 }
             }
         }
@@ -839,31 +867,31 @@ impl App {
         self.calculate_pending_changes();
         if self.has_pending_changes() {
             self.state = AppState::ShowingChanges;
-            self.changes_scroll = 0;
+            self.modals.changes_scroll = 0;
         } else {
             self.status_message = "No changes to apply".to_string();
         }
     }
 
     pub fn has_pending_changes(&self) -> bool {
-        !self.pending_changes.to_install.is_empty()
-            || !self.pending_changes.to_upgrade.is_empty()
-            || !self.pending_changes.to_remove.is_empty()
-            || !self.pending_changes.auto_install.is_empty()
-            || !self.pending_changes.auto_remove.is_empty()
+        !self.pkg.pending.to_install.is_empty()
+            || !self.pkg.pending.to_upgrade.is_empty()
+            || !self.pkg.pending.to_remove.is_empty()
+            || !self.pkg.pending.auto_install.is_empty()
+            || !self.pkg.pending.auto_remove.is_empty()
     }
 
     pub fn total_changes_count(&self) -> usize {
-        self.pending_changes.to_install.len()
-            + self.pending_changes.to_upgrade.len()
-            + self.pending_changes.to_remove.len()
-            + self.pending_changes.auto_install.len()
-            + self.pending_changes.auto_remove.len()
+        self.pkg.pending.to_install.len()
+            + self.pkg.pending.to_upgrade.len()
+            + self.pkg.pending.to_remove.len()
+            + self.pkg.pending.auto_install.len()
+            + self.pkg.pending.auto_remove.len()
     }
 
     pub fn update_upgradable_count(&mut self) {
-        self.upgradable_count = self
-            .cache
+        self.pkg.upgradable_count = self
+            .pkg.cache
             .packages(&PackageSort::default())
             .filter(|p| p.is_upgradable())
             .count();
@@ -876,33 +904,33 @@ impl App {
             self.status_message = format!(
                 "{} changes pending ({} download) | {} upgradable | Press 'u' to review",
                 changes,
-                PackageInfo::size_str(self.pending_changes.download_size),
-                self.upgradable_count
+                PackageInfo::size_str(self.pkg.pending.download_size),
+                self.pkg.upgradable_count
             );
         } else {
-            self.status_message = format!("{} packages upgradable", self.upgradable_count);
+            self.status_message = format!("{} packages upgradable", self.pkg.upgradable_count);
         }
     }
 
     pub fn move_package_selection(&mut self, delta: i32) {
-        if self.packages.is_empty() {
+        if self.pkg.list.is_empty() {
             return;
         }
-        let current = self.table_state.selected().unwrap_or(0) as i32;
-        let new_idx = (current + delta).clamp(0, self.packages.len() as i32 - 1) as usize;
-        self.table_state.select(Some(new_idx));
-        self.detail_scroll = 0;
+        let current = self.ui.table_state.selected().unwrap_or(0) as i32;
+        let new_idx = (current + delta).clamp(0, self.pkg.list.len() as i32 - 1) as usize;
+        self.ui.table_state.select(Some(new_idx));
+        self.details.scroll = 0;
         self.update_cached_deps();
     }
 
     pub fn move_filter_selection(&mut self, delta: i32) {
         let filters = FilterCategory::all();
-        let current = self.filter_state.selected().unwrap_or(0) as i32;
+        let current = self.ui.filter_state.selected().unwrap_or(0) as i32;
         let new_idx = (current + delta).clamp(0, filters.len() as i32 - 1) as usize;
-        self.filter_state.select(Some(new_idx));
-        self.selected_filter = filters[new_idx];
+        self.ui.filter_state.select(Some(new_idx));
+        self.ui.selected_filter = filters[new_idx];
         self.apply_current_filter();
-        self.table_state.select(if self.packages.is_empty() {
+        self.ui.table_state.select(if self.pkg.list.is_empty() {
             None
         } else {
             Some(0)
@@ -911,31 +939,31 @@ impl App {
 
     /// Scroll changelog with bounds checking
     pub fn scroll_changelog(&mut self, delta: i32) {
-        let max_scroll = self.changelog_content.len().saturating_sub(1) as u16;
-        let current = self.changelog_scroll as i32;
-        self.changelog_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let max_scroll = self.modals.changelog_content.len().saturating_sub(1) as u16;
+        let current = self.modals.changelog_scroll as i32;
+        self.modals.changelog_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
     }
 
     /// Get the number of lines in the pending changes display
     pub fn changes_line_count(&self) -> usize {
         let mut count = 2; // Header lines
-        if !self.pending_changes.to_upgrade.is_empty() {
-            count += 2 + self.pending_changes.to_upgrade.len();
+        if !self.pkg.pending.to_upgrade.is_empty() {
+            count += 2 + self.pkg.pending.to_upgrade.len();
         }
-        if !self.pending_changes.to_install.is_empty() {
-            count += 2 + self.pending_changes.to_install.len();
+        if !self.pkg.pending.to_install.is_empty() {
+            count += 2 + self.pkg.pending.to_install.len();
         }
-        if !self.pending_changes.auto_upgrade.is_empty() {
-            count += 2 + self.pending_changes.auto_upgrade.len();
+        if !self.pkg.pending.auto_upgrade.is_empty() {
+            count += 2 + self.pkg.pending.auto_upgrade.len();
         }
-        if !self.pending_changes.auto_install.is_empty() {
-            count += 2 + self.pending_changes.auto_install.len();
+        if !self.pkg.pending.auto_install.is_empty() {
+            count += 2 + self.pkg.pending.auto_install.len();
         }
-        if !self.pending_changes.to_remove.is_empty() {
-            count += 2 + self.pending_changes.to_remove.len();
+        if !self.pkg.pending.to_remove.is_empty() {
+            count += 2 + self.pkg.pending.to_remove.len();
         }
-        if !self.pending_changes.auto_remove.is_empty() {
-            count += 2 + self.pending_changes.auto_remove.len();
+        if !self.pkg.pending.auto_remove.is_empty() {
+            count += 2 + self.pkg.pending.auto_remove.len();
         }
         count + 4 // Footer lines (size info)
     }
@@ -943,28 +971,28 @@ impl App {
     /// Scroll changes view with bounds checking
     pub fn scroll_changes(&mut self, delta: i32) {
         let max_scroll = self.changes_line_count().saturating_sub(5) as u16; // Assume ~5 visible lines minimum
-        let current = self.changes_scroll as i32;
-        self.changes_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let current = self.modals.changes_scroll as i32;
+        self.modals.changes_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
     }
 
     /// Get the number of lines in the mark confirmation display
     pub fn mark_confirm_line_count(&self) -> usize {
         let mut count = 4; // Header lines
-        count += self.mark_preview.additional_upgrades.len();
-        count += self.mark_preview.additional_installs.len();
-        count += self.mark_preview.additional_removes.len();
+        count += self.pkg.mark_preview.additional_upgrades.len();
+        count += self.pkg.mark_preview.additional_installs.len();
+        count += self.pkg.mark_preview.additional_removes.len();
         count + 4 // Footer lines
     }
 
     /// Scroll mark confirmation view with bounds checking
     pub fn scroll_mark_confirm(&mut self, delta: i32) {
         let max_scroll = self.mark_confirm_line_count().saturating_sub(5) as u16;
-        let current = self.mark_confirm_scroll as i32;
-        self.mark_confirm_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let current = self.modals.mark_confirm_scroll as i32;
+        self.modals.mark_confirm_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
     }
 
     pub fn cycle_focus(&mut self) {
-        self.focused_pane = match self.focused_pane {
+        self.ui.focused_pane = match self.ui.focused_pane {
             FocusedPane::Filters => FocusedPane::Packages,
             FocusedPane::Packages => FocusedPane::Details,
             FocusedPane::Details => FocusedPane::Filters,
@@ -972,7 +1000,7 @@ impl App {
     }
 
     pub fn cycle_focus_back(&mut self) {
-        self.focused_pane = match self.focused_pane {
+        self.ui.focused_pane = match self.ui.focused_pane {
             FocusedPane::Filters => FocusedPane::Details,
             FocusedPane::Packages => FocusedPane::Filters,
             FocusedPane::Details => FocusedPane::Packages,
@@ -1031,7 +1059,7 @@ impl App {
         let mut install_progress = InstallProgress::apt();
 
         // Take ownership of cache for commit (it consumes self)
-        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+        let cache = std::mem::replace(&mut self.pkg.cache, Cache::new::<&str>(&[])?);
 
         match cache.commit(&mut acquire_progress, &mut install_progress) {
             Ok(()) => {
@@ -1050,9 +1078,9 @@ impl App {
         }
 
         // Clear state after commit
-        self.user_marked.clear();
-        self.pending_changes = PendingChanges::default();
-        self.search_index = None;
+        self.pkg.user_marked.clear();
+        self.pkg.pending = PendingChanges::default();
+        self.search.index = None;
 
         Ok(())
     }
@@ -1068,16 +1096,16 @@ impl App {
         let mut args = vec!["apt-get".to_string(), "-y".to_string()];
 
         // Collect packages to install/upgrade
-        let to_install: Vec<&str> = self.pending_changes.to_install.iter()
-            .chain(self.pending_changes.to_upgrade.iter())
-            .chain(self.pending_changes.auto_install.iter())
-            .chain(self.pending_changes.auto_upgrade.iter())
+        let to_install: Vec<&str> = self.pkg.pending.to_install.iter()
+            .chain(self.pkg.pending.to_upgrade.iter())
+            .chain(self.pkg.pending.auto_install.iter())
+            .chain(self.pkg.pending.auto_upgrade.iter())
             .map(|s| s.as_str())
             .collect();
 
         // Collect packages to remove
-        let to_remove: Vec<String> = self.pending_changes.to_remove.iter()
-            .chain(self.pending_changes.auto_remove.iter())
+        let to_remove: Vec<String> = self.pkg.pending.to_remove.iter()
+            .chain(self.pkg.pending.auto_remove.iter())
             .map(|s| format!("{}-", s))  // apt-get syntax for remove
             .collect();
 
@@ -1145,9 +1173,9 @@ impl App {
         }
 
         // Clear state after commit
-        self.user_marked.clear();
-        self.pending_changes = PendingChanges::default();
-        self.search_index = None;
+        self.pkg.user_marked.clear();
+        self.pkg.pending = PendingChanges::default();
+        self.search.index = None;
 
         Ok(())
     }
@@ -1159,12 +1187,12 @@ impl App {
             return Ok(()); // Not a fatal error, just can't refresh
         }
 
-        self.cache = Cache::new::<&str>(&[])?;
-        self.user_marked.clear();
-        self.pending_changes = PendingChanges::default();
-        self.search_index = None; // Force rebuild on next search
-        self.search_query.clear();
-        self.search_results = None;
+        self.pkg.cache = Cache::new::<&str>(&[])?;
+        self.pkg.user_marked.clear();
+        self.pkg.pending = PendingChanges::default();
+        self.search.index = None; // Force rebuild on next search
+        self.search.query.clear();
+        self.search.results = None;
         self.update_upgradable_count();
         self.reload_packages()?;
         Ok(())

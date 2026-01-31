@@ -14,25 +14,17 @@
 
 ### Error Handling
 - [ ] Stop silently discarding `Result` values with `let _ =` pattern
-- [ ] Capture and display apt-get stderr on failure (not just generic "failed" message)
-- [ ] Check for APT lock files (`/var/lib/dpkg/lock`) before operations
 - [ ] Show specific conflict information when dependency resolution fails
 
 ### Performance
-- [ ] Cache upgradable package count (avoid iterating all packages in `update_status_message`)
 - [ ] Wrap SQLite FTS index inserts in a transaction for faster builds
 - [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
 - [ ] Avoid per-frame string clones in render loop (use `Cow` or references)
 
 ### Architecture
 - [ ] Move `update_cached_deps()` out of render function (side effect in render)
-- [ ] Split `App` struct (30+ fields) into smaller focused types:
-  - `PackageManager` - cache operations, marks, changes
-  - `UiState` - focus, scroll, selection
-  - `SearchState` - query, results, index
 
 ### UI/UX
-- [ ] Fix scroll bounds checking (scroll can exceed content height causing blank screens)
 - [ ] Add scrollbar position indicator to modals
 - [ ] Ensure table viewport scrolls to keep selection visible
 - [ ] Live output during upgrade (async)
@@ -63,14 +55,9 @@
 - [ ] Add `#[must_use]` attributes to functions like `has_pending_changes()`, `is_root()`
 - [ ] Rename `PackageStatus::Upgrade` to `MarkedForUpgrade` for clarity
 - [ ] Make state transitions more explicit (typestate pattern or state machine)
-- [ ] Split `main.rs` into multiple files:
-  - `app.rs` - App state and logic
-  - `ui.rs` - Render functions
-  - `apt.rs` - APT cache wrapper
-  - `search.rs` - FTS5 index
+- [ ] Extract APT cache wrapper to separate `apt.rs` module
 
 ### Error Messages
-- [ ] Detect APT lock held by another process and show friendly message
 - [ ] Show "Resuming interrupted operation" when APT detects partial commit
 
 ## Low Priority
