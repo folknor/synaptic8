@@ -1,6 +1,8 @@
+mod search;
+mod types;
+
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -16,364 +18,9 @@ use ratatui::widgets::{
 use rust_apt::cache::{Cache, PackageSort};
 use rust_apt::progress::{AcquireProgress, InstallProgress};
 use rust_apt::{Package, Version};
-use rusqlite::{Connection, params};
 
-/// Package status matching Synaptic's status icons
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageStatus {
-    Upgradable,   // ↑ Package can be upgraded (yellow)
-    Upgrade,      // ↑ Package marked for upgrade (green)
-    Install,      // + Package marked for install
-    Remove,       // - Package marked for removal
-    Keep,         // = Package kept at current version
-    Installed,    // · Package is installed (no changes)
-    NotInstalled, //   Package is not installed
-    Broken,       // ✗ Package is broken
-    AutoInstall,  // + Automatically installed (dependency)
-    AutoRemove,   // - Automatically removed
-}
-
-impl PackageStatus {
-    fn symbol(&self) -> &'static str {
-        match self {
-            Self::Upgradable | Self::Upgrade => "↑",
-            Self::Install | Self::AutoInstall => "+",
-            Self::Remove | Self::AutoRemove => "-",
-            Self::Keep => "=",
-            Self::Installed => "·",
-            Self::NotInstalled => "",
-            Self::Broken => "✗",
-        }
-    }
-
-    fn color(&self) -> Color {
-        match self {
-            Self::Upgradable => Color::Yellow,
-            Self::Upgrade => Color::Green,
-            Self::Install | Self::AutoInstall => Color::Green,
-            Self::Remove | Self::AutoRemove => Color::Red,
-            Self::Keep => Color::Blue,
-            Self::Installed => Color::DarkGray,
-            Self::NotInstalled => Color::Gray,
-            Self::Broken => Color::LightRed,
-        }
-    }
-}
-
-/// Filter categories (left panel)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterCategory {
-    Upgradable,
-    MarkedChanges,
-    Installed,
-    NotInstalled,
-    All,
-}
-
-impl FilterCategory {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Upgradable => "Upgradable",
-            Self::MarkedChanges => "Marked Changes",
-            Self::Installed => "Installed",
-            Self::NotInstalled => "Not Installed",
-            Self::All => "All Packages",
-        }
-    }
-
-    fn all() -> &'static [FilterCategory] {
-        &[
-            Self::Upgradable,
-            Self::MarkedChanges,
-            Self::Installed,
-            Self::NotInstalled,
-            Self::All,
-        ]
-    }
-}
-
-/// Displayed package info (extracted from rust-apt Package)
-#[derive(Debug, Clone)]
-struct PackageInfo {
-    name: String,
-    status: PackageStatus,
-    section: String,
-    installed_version: String,
-    candidate_version: String,
-    installed_size: u64,
-    download_size: u64,
-    description: String,
-    architecture: String,
-    is_user_marked: bool,
-}
-
-impl PackageInfo {
-    fn size_str(bytes: u64) -> String {
-        if bytes == 0 {
-            return String::from("-");
-        }
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        const GB: u64 = MB * 1024;
-
-        if bytes >= GB {
-            format!("{:.1} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.1} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.1} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
-
-    fn installed_size_str(&self) -> String {
-        Self::size_str(self.installed_size)
-    }
-
-    fn download_size_str(&self) -> String {
-        Self::size_str(self.download_size)
-    }
-}
-
-/// Column configuration
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Column {
-    Status,
-    Name,
-    Section,
-    InstalledVersion,
-    CandidateVersion,
-    DownloadSize,
-}
-
-impl Column {
-    fn header(&self) -> &'static str {
-        match self {
-            Self::Status => "S",
-            Self::Name => "Package",
-            Self::Section => "Section",
-            Self::InstalledVersion => "Installed",
-            Self::CandidateVersion => "Candidate",
-            Self::DownloadSize => "Download",
-        }
-    }
-
-    fn width(&self, app: &App) -> Constraint {
-        match self {
-            Self::Status => Constraint::Length(3),
-            Self::Name => Constraint::Min(app.col_width_name),
-            Self::Section => Constraint::Length(app.col_width_section),
-            Self::InstalledVersion => Constraint::Length(app.col_width_installed),
-            Self::CandidateVersion => Constraint::Length(app.col_width_candidate),
-            Self::DownloadSize => Constraint::Length(10),
-        }
-    }
-
-    fn visible_columns(settings: &Settings) -> Vec<Column> {
-        let mut cols = Vec::new();
-        if settings.show_status_column {
-            cols.push(Self::Status);
-        }
-        if settings.show_name_column {
-            cols.push(Self::Name);
-        }
-        if settings.show_section_column {
-            cols.push(Self::Section);
-        }
-        if settings.show_installed_version_column {
-            cols.push(Self::InstalledVersion);
-        }
-        if settings.show_candidate_version_column {
-            cols.push(Self::CandidateVersion);
-        }
-        if settings.show_download_size_column {
-            cols.push(Self::DownloadSize);
-        }
-        cols
-    }
-}
-
-/// Which pane has focus
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FocusedPane {
-    Filters,
-    Packages,
-    Details,
-}
-
-/// Which tab is shown in details pane
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetailsTab {
-    Info,
-    Dependencies,
-    ReverseDeps,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum AppState {
-    Listing,
-    Searching,          // User is typing a search query
-    ShowingMarkConfirm, // Popup showing additional changes when marking a package
-    ShowingChanges,     // Final confirmation before applying all changes
-    ShowingChangelog,   // Viewing package changelog
-    ShowingSettings,    // Settings/preferences view
-    EnteringPassword,   // Entering sudo password
-    Upgrading,
-    Done,
-}
-
-/// Sort options
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortBy {
-    Name,
-    Section,
-    InstalledVersion,
-    CandidateVersion,
-}
-
-impl SortBy {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Name => "Name",
-            Self::Section => "Section",
-            Self::InstalledVersion => "Installed version",
-            Self::CandidateVersion => "Candidate version",
-        }
-    }
-
-    fn all() -> &'static [SortBy] {
-        &[Self::Name, Self::Section, Self::InstalledVersion, Self::CandidateVersion]
-    }
-}
-
-/// User settings (not persisted yet)
-#[derive(Debug, Clone)]
-struct Settings {
-    show_status_column: bool,
-    show_name_column: bool,
-    show_section_column: bool,
-    show_installed_version_column: bool,
-    show_candidate_version_column: bool,
-    show_download_size_column: bool,
-    sort_by: SortBy,
-    sort_ascending: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            show_status_column: true,
-            show_name_column: true,
-            show_section_column: false,
-            show_installed_version_column: false,
-            show_candidate_version_column: true,
-            show_download_size_column: false,
-            sort_by: SortBy::CandidateVersion,
-            sort_ascending: true,
-        }
-    }
-}
-
-/// Result of attempting to apply changes
-enum ApplyResult {
-    NeedsPassword,
-    NeedsCommit,
-}
-
-/// Additional changes required when marking a single package
-#[derive(Debug, Default, Clone)]
-struct MarkPreview {
-    package_name: String,
-    is_marking: bool, // true = marking for install, false = unmarking
-    additional_installs: Vec<String>,
-    additional_upgrades: Vec<String>,
-    additional_removes: Vec<String>,
-    download_size: u64,
-}
-
-/// Changes to be applied
-#[derive(Debug, Default)]
-struct PendingChanges {
-    to_install: Vec<String>,
-    to_upgrade: Vec<String>,
-    to_remove: Vec<String>,
-    auto_install: Vec<String>,
-    auto_upgrade: Vec<String>,
-    auto_remove: Vec<String>,
-    download_size: u64,
-    install_size_change: i64,
-}
-
-/// SQLite FTS5 search index
-struct SearchIndex {
-    conn: Connection,
-}
-
-impl SearchIndex {
-    fn new() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS packages USING fts5(name, description)",
-            [],
-        )?;
-        Ok(Self { conn })
-    }
-
-    fn build(&mut self, cache: &Cache) -> Result<(usize, std::time::Duration)> {
-        let start = Instant::now();
-        let mut count = 0;
-
-        // Use transaction for much faster bulk inserts
-        self.conn.execute("BEGIN TRANSACTION", [])?;
-
-        // Clear existing data
-        self.conn.execute("DELETE FROM packages", [])?;
-
-        // Insert all packages
-        let mut stmt = self.conn.prepare("INSERT INTO packages (name, description) VALUES (?, ?)")?;
-
-        for pkg in cache.packages(&PackageSort::default()) {
-            let name = pkg.name();
-            let desc = pkg.candidate()
-                .and_then(|c| c.summary())
-                .unwrap_or_default();
-            stmt.execute(params![name, desc])?;
-            count += 1;
-        }
-
-        self.conn.execute("COMMIT", [])?;
-
-        Ok((count, start.elapsed()))
-    }
-
-    fn search(&self, query: &str) -> Result<HashSet<String>> {
-        let mut results = HashSet::new();
-
-        if query.is_empty() {
-            return Ok(results);
-        }
-
-        // Escape special FTS5 characters and add prefix matching
-        let fts_query = query
-            .split_whitespace()
-            .map(|word| format!("{}*", word.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT name FROM packages WHERE packages MATCH ?"
-        )?;
-
-        let rows = stmt.query_map([&fts_query], |row| row.get::<_, String>(0))?;
-
-        for name in rows.flatten() {
-            results.insert(name);
-        }
-
-        Ok(results)
-    }
-}
+use search::SearchIndex;
+use types::*;
 
 struct App {
     cache: Cache,
@@ -408,10 +55,7 @@ struct App {
     cached_rdeps: Vec<(String, String)>,
     cached_pkg_name: String,
     // Column widths (calculated from content)
-    col_width_name: u16,
-    col_width_section: u16,
-    col_width_installed: u16,
-    col_width_candidate: u16,
+    col_widths: ColumnWidths,
     // Sudo password input
     sudo_password: String,
     // Multi-select (visual mode)
@@ -456,10 +100,7 @@ impl App {
             cached_deps: Vec::new(),
             cached_rdeps: Vec::new(),
             cached_pkg_name: String::new(),
-            col_width_name: 10,
-            col_width_section: 7,
-            col_width_installed: 9,
-            col_width_candidate: 9,
+            col_widths: ColumnWidths::new(),
             sudo_password: String::new(),
             multi_select: HashSet::new(),
             selection_anchor: None,
@@ -658,10 +299,7 @@ impl App {
         self.visual_mode = false;
 
         // Reset column widths to header minimums
-        self.col_width_name = 7;      // "Package"
-        self.col_width_section = 7;   // "Section"
-        self.col_width_installed = 9; // "Installed"
-        self.col_width_candidate = 9; // "Candidate"
+        self.col_widths.reset();
 
         let sort = if self.selected_filter == FilterCategory::Upgradable {
             PackageSort::default().upgradable()
@@ -690,10 +328,10 @@ impl App {
             if matches_category && matches_search {
                 if let Some(info) = self.extract_package_info(&pkg) {
                     // Track max column widths
-                    self.col_width_name = self.col_width_name.max(info.name.len() as u16);
-                    self.col_width_section = self.col_width_section.max(info.section.len() as u16);
-                    self.col_width_installed = self.col_width_installed.max(info.installed_version.len() as u16);
-                    self.col_width_candidate = self.col_width_candidate.max(info.candidate_version.len() as u16);
+                    self.col_widths.name = self.col_widths.name.max(info.name.len() as u16);
+                    self.col_widths.section = self.col_widths.section.max(info.section.len() as u16);
+                    self.col_widths.installed = self.col_widths.installed.max(info.installed_version.len() as u16);
+                    self.col_widths.candidate = self.col_widths.candidate.max(info.candidate_version.len() as u16);
                     self.packages.push(info);
                 }
             }
@@ -2102,7 +1740,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width(app)).collect();
+    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width(&app.col_widths)).collect();
 
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
