@@ -324,6 +324,9 @@ impl SearchIndex {
         let start = Instant::now();
         let mut count = 0;
 
+        // Use transaction for much faster bulk inserts
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+
         // Clear existing data
         self.conn.execute("DELETE FROM packages", [])?;
 
@@ -338,6 +341,8 @@ impl SearchIndex {
             stmt.execute(params![name, desc])?;
             count += 1;
         }
+
+        self.conn.execute("COMMIT", [])?;
 
         Ok((count, start.elapsed()))
     }
@@ -413,6 +418,8 @@ struct App {
     multi_select: HashSet<usize>,    // Indices of selected packages in current list
     selection_anchor: Option<usize>, // Anchor point for range selection
     visual_mode: bool,               // Whether visual selection mode is active
+    // Cached counts (avoid iterating all packages repeatedly)
+    upgradable_count: usize,
 }
 
 impl App {
@@ -457,8 +464,10 @@ impl App {
             multi_select: HashSet::new(),
             selection_anchor: None,
             visual_mode: false,
+            upgradable_count: 0,
         };
 
+        app.update_upgradable_count();
         app.reload_packages()?;
         Ok(app)
     }
@@ -637,6 +646,7 @@ impl App {
             self.table_state.select(Some(0));
         }
 
+        self.update_cached_deps();
         self.update_status_message();
         Ok(())
     }
@@ -1224,13 +1234,15 @@ impl App {
             + self.pending_changes.auto_remove.len()
     }
 
-    fn update_status_message(&mut self) {
-        let upgradable_count = self
+    fn update_upgradable_count(&mut self) {
+        self.upgradable_count = self
             .cache
             .packages(&PackageSort::default())
             .filter(|p| p.is_upgradable())
             .count();
+    }
 
+    fn update_status_message(&mut self) {
         let changes = self.total_changes_count();
 
         if changes > 0 {
@@ -1238,10 +1250,10 @@ impl App {
                 "{} changes pending ({} download) | {} upgradable | Press 'u' to review",
                 changes,
                 PackageInfo::size_str(self.pending_changes.download_size),
-                upgradable_count
+                self.upgradable_count
             );
         } else {
-            self.status_message = format!("{} packages upgradable", upgradable_count);
+            self.status_message = format!("{} packages upgradable", self.upgradable_count);
         }
     }
 
@@ -1253,6 +1265,7 @@ impl App {
         let new_idx = (current + delta).clamp(0, self.packages.len() as i32 - 1) as usize;
         self.table_state.select(Some(new_idx));
         self.detail_scroll = 0;
+        self.update_cached_deps();
     }
 
     fn move_filter_selection(&mut self, delta: i32) {
@@ -1336,7 +1349,7 @@ impl App {
 
     /// Commit changes using sudo -S (password piped to stdin)
     fn commit_with_sudo(&mut self) -> Result<()> {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
         println!("\n=== Applying changes with sudo ===\n");
@@ -1368,11 +1381,12 @@ impl App {
             }
         }
 
-        // Run sudo -S apt-get ...
+        // Run sudo -S apt-get ... (capture stderr for error reporting)
         let mut child = Command::new("sudo")
             .arg("-S")
             .args(&args)
             .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         // Write password to stdin
@@ -1382,6 +1396,12 @@ impl App {
 
         // Clear password from memory
         self.sudo_password.clear();
+
+        // Capture stderr
+        let mut stderr_output = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut stderr_output);
+        }
 
         // Wait for completion
         let status = child.wait()?;
@@ -1393,7 +1413,23 @@ impl App {
             self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
         } else {
             println!("\n=== Error applying changes ===");
-            self.output_lines.push("Error: apt-get failed. Check password or permissions.".to_string());
+            // Show captured stderr for debugging
+            if !stderr_output.is_empty() {
+                // Filter out sudo password prompt from stderr
+                let filtered_err: String = stderr_output
+                    .lines()
+                    .filter(|line| !line.contains("[sudo] password"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !filtered_err.is_empty() {
+                    println!("{}", filtered_err);
+                    self.output_lines.push(format!("Error: {}", filtered_err.lines().next().unwrap_or("apt-get failed")));
+                } else {
+                    self.output_lines.push("Error: apt-get failed (wrong password?)".to_string());
+                }
+            } else {
+                self.output_lines.push("Error: apt-get failed".to_string());
+            }
             self.state = AppState::Done;
             self.status_message = "Error: apt-get failed. Press 'q' to quit or 'r' to refresh.".to_string();
         }
@@ -1413,6 +1449,7 @@ impl App {
         self.search_index = None; // Force rebuild on next search
         self.search_query.clear();
         self.search_results = None;
+        self.update_upgradable_count();
         self.reload_packages()?;
         Ok(())
     }
@@ -1999,10 +2036,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Update cached deps if selection changed
-    app.update_cached_deps();
-
+fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.focused_pane == FocusedPane::Details;
 
     let border_style = if is_focused {
