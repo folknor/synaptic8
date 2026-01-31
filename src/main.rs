@@ -1103,7 +1103,9 @@ impl App {
 
         // Resolve dependencies
         if !self.user_marked.is_empty() {
-            let _ = self.cache.resolve(true);
+            if let Err(e) = self.cache.resolve(true) {
+                self.status_message = format!("Warning: dependency resolution issue: {}", e);
+            }
         }
     }
 
@@ -1116,7 +1118,9 @@ impl App {
             pkg.mark_install(true, true);
             pkg.protect();
         }
-        let _ = self.cache.resolve(true);
+        if let Err(e) = self.cache.resolve(true) {
+            self.status_message = format!("Warning: dependency resolution issue: {}", e);
+        }
 
         // Record in user_marked
         self.user_marked.insert(name, true);
@@ -1282,6 +1286,60 @@ impl App {
         });
     }
 
+    /// Scroll changelog with bounds checking
+    fn scroll_changelog(&mut self, delta: i32) {
+        let max_scroll = self.changelog_content.len().saturating_sub(1) as u16;
+        let current = self.changelog_scroll as i32;
+        self.changelog_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+    }
+
+    /// Get the number of lines in the pending changes display
+    fn changes_line_count(&self) -> usize {
+        let mut count = 2; // Header lines
+        if !self.pending_changes.to_upgrade.is_empty() {
+            count += 2 + self.pending_changes.to_upgrade.len();
+        }
+        if !self.pending_changes.to_install.is_empty() {
+            count += 2 + self.pending_changes.to_install.len();
+        }
+        if !self.pending_changes.auto_upgrade.is_empty() {
+            count += 2 + self.pending_changes.auto_upgrade.len();
+        }
+        if !self.pending_changes.auto_install.is_empty() {
+            count += 2 + self.pending_changes.auto_install.len();
+        }
+        if !self.pending_changes.to_remove.is_empty() {
+            count += 2 + self.pending_changes.to_remove.len();
+        }
+        if !self.pending_changes.auto_remove.is_empty() {
+            count += 2 + self.pending_changes.auto_remove.len();
+        }
+        count + 4 // Footer lines (size info)
+    }
+
+    /// Scroll changes view with bounds checking
+    fn scroll_changes(&mut self, delta: i32) {
+        let max_scroll = self.changes_line_count().saturating_sub(5) as u16; // Assume ~5 visible lines minimum
+        let current = self.changes_scroll as i32;
+        self.changes_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+    }
+
+    /// Get the number of lines in the mark confirmation display
+    fn mark_confirm_line_count(&self) -> usize {
+        let mut count = 4; // Header lines
+        count += self.mark_preview.additional_upgrades.len();
+        count += self.mark_preview.additional_installs.len();
+        count += self.mark_preview.additional_removes.len();
+        count + 4 // Footer lines
+    }
+
+    /// Scroll mark confirmation view with bounds checking
+    fn scroll_mark_confirm(&mut self, delta: i32) {
+        let max_scroll = self.mark_confirm_line_count().saturating_sub(5) as u16;
+        let current = self.mark_confirm_scroll as i32;
+        self.mark_confirm_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+    }
+
     fn cycle_focus(&mut self) {
         self.focused_pane = match self.focused_pane {
             FocusedPane::Filters => FocusedPane::Packages,
@@ -1300,6 +1358,35 @@ impl App {
 
     fn is_root() -> bool {
         unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Check if APT lock files are held by another process
+    fn check_apt_lock() -> Option<String> {
+        use std::fs::File;
+        use std::os::unix::io::AsRawFd;
+
+        let lock_paths = [
+            "/var/lib/dpkg/lock-frontend",
+            "/var/lib/dpkg/lock",
+            "/var/lib/apt/lists/lock",
+        ];
+
+        for path in &lock_paths {
+            if let Ok(file) = File::open(path) {
+                // Try to get an exclusive lock (non-blocking)
+                let fd = file.as_raw_fd();
+                let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+                if ret != 0 {
+                    return Some(format!(
+                        "Another package manager is running ({}). Close it and try again.",
+                        path
+                    ));
+                }
+                // Release the lock immediately
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+        }
+        None
     }
 
     fn apply_changes(&mut self) -> ApplyResult {
@@ -1443,6 +1530,12 @@ impl App {
     }
 
     fn refresh_cache(&mut self) -> Result<()> {
+        // Check for APT locks first
+        if let Some(msg) = Self::check_apt_lock() {
+            self.status_message = msg;
+            return Ok(()); // Not a fatal error, just can't refresh
+        }
+
         self.cache = Cache::new::<&str>(&[])?;
         self.user_marked.clear();
         self.pending_changes = PendingChanges::default();
@@ -1564,7 +1657,9 @@ fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Char('r') => {
-                            let _ = app.refresh_cache();
+                            if let Err(e) = app.refresh_cache() {
+                                app.status_message = format!("Refresh failed: {}", e);
+                            }
                         }
                         _ => {}
                     },
@@ -1599,10 +1694,10 @@ fn main() -> Result<()> {
                             app.cancel_mark();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            app.mark_confirm_scroll = app.mark_confirm_scroll.saturating_sub(1);
+                            app.scroll_mark_confirm(-1);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            app.mark_confirm_scroll = app.mark_confirm_scroll.saturating_add(1);
+                            app.scroll_mark_confirm(1);
                         }
                         _ => {}
                     },
@@ -1617,8 +1712,10 @@ fn main() -> Result<()> {
                                     disable_raw_mode()?;
                                     io::stdout().execute(LeaveAlternateScreen)?;
 
-                                    // Run the actual commit
-                                    let _ = app.commit_changes();
+                                    // Run the actual commit (errors handled internally)
+                                    if let Err(e) = app.commit_changes() {
+                                        println!("Commit error: {}", e);
+                                    }
 
                                     // Wait for user to acknowledge
                                     println!("\nPress Enter to continue...");
@@ -1630,7 +1727,9 @@ fn main() -> Result<()> {
                                     io::stdout().execute(EnterAlternateScreen)?;
 
                                     // Refresh the cache
-                                    let _ = app.refresh_cache();
+                                    if let Err(e) = app.refresh_cache() {
+                                        app.status_message = format!("Cache refresh failed: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -1638,10 +1737,10 @@ fn main() -> Result<()> {
                             app.state = AppState::Listing;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            app.changes_scroll = app.changes_scroll.saturating_sub(1);
+                            app.scroll_changes(-1);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            app.changes_scroll = app.changes_scroll.saturating_add(1);
+                            app.scroll_changes(1);
                         }
                         _ => {}
                     },
@@ -1655,8 +1754,10 @@ fn main() -> Result<()> {
                             disable_raw_mode()?;
                             io::stdout().execute(LeaveAlternateScreen)?;
 
-                            // Run the commit with sudo
-                            let _ = app.commit_with_sudo();
+                            // Run the commit with sudo (errors handled internally)
+                            if let Err(e) = app.commit_with_sudo() {
+                                println!("Commit error: {}", e);
+                            }
 
                             // Wait for user to acknowledge
                             println!("\nPress Enter to continue...");
@@ -1668,7 +1769,9 @@ fn main() -> Result<()> {
                             io::stdout().execute(EnterAlternateScreen)?;
 
                             // Refresh the cache
-                            let _ = app.refresh_cache();
+                            if let Err(e) = app.refresh_cache() {
+                                app.status_message = format!("Cache refresh failed: {}", e);
+                            }
                         }
                         KeyCode::Backspace => {
                             app.sudo_password.pop();
@@ -1683,16 +1786,16 @@ fn main() -> Result<()> {
                             app.state = AppState::Listing;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            app.changelog_scroll = app.changelog_scroll.saturating_sub(1);
+                            app.scroll_changelog(-1);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            app.changelog_scroll = app.changelog_scroll.saturating_add(1);
+                            app.scroll_changelog(1);
                         }
                         KeyCode::PageUp => {
-                            app.changelog_scroll = app.changelog_scroll.saturating_sub(20);
+                            app.scroll_changelog(-20);
                         }
                         KeyCode::PageDown => {
-                            app.changelog_scroll = app.changelog_scroll.saturating_add(20);
+                            app.scroll_changelog(20);
                         }
                         _ => {}
                     },
@@ -1720,7 +1823,9 @@ fn main() -> Result<()> {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('r') => {
                             app.state = AppState::Listing;
-                            let _ = app.refresh_cache();
+                            if let Err(e) = app.refresh_cache() {
+                                app.status_message = format!("Refresh failed: {}", e);
+                            }
                         }
                         _ => {}
                     },
