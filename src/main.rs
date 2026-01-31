@@ -117,7 +117,7 @@ fn main() -> Result<()> {
                         KeyCode::Char('c') => app.show_changelog(),
                         KeyCode::Char('s') => app.show_settings(),
                         KeyCode::Char('u') => app.show_changes_preview(),
-                        KeyCode::Char('a') | KeyCode::Char('x') => app.mark_all_upgrades(),
+                        KeyCode::Char('x') => app.mark_all_upgrades(),
                         KeyCode::Char('N') => app.unmark_all(),
                         KeyCode::Char('r') => {
                             if let Err(e) = app.refresh_cache() {

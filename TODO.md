@@ -12,7 +12,6 @@
 - [ ] Show specific conflict information when dependency resolution fails
 
 ### Performance
-- [ ] Wrap SQLite FTS index inserts in a transaction for faster builds
 - [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
 - [ ] Avoid per-frame string clones in render loop (use `Cow` or references)
 
@@ -63,11 +62,9 @@
 ### Polish
 - [ ] Remember scroll position when switching filter categories
 - [ ] Make search query more visually prominent when active
-- [ ] Remove duplicate keybinding (`a` and `x` both do mark-all-upgrades)
 - [ ] Consider lazy evaluation or async loading for cache reload in `restore_marks()`
 
 ### Documentation
-- [ ] Document the `s` (settings) key in help bar
 - [ ] Man page
 - [ ] Command-line arguments (--help, --version)
 

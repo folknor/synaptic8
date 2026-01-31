@@ -126,7 +126,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             } else if app.search.results.is_some() {
                 "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ u:Apply │ q:Quit"
+                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
