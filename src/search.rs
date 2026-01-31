@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use rust_apt::cache::{Cache, PackageSort};
+use rust_apt::cache::PackageSort;
 use rusqlite::{Connection, params};
+
+use crate::apt::AptManager;
 
 /// SQLite FTS5 search index for packages
 pub struct SearchIndex {
@@ -23,7 +25,7 @@ impl SearchIndex {
     }
 
     /// Build the search index from the APT cache
-    pub fn build(&mut self, cache: &Cache) -> Result<(usize, Duration)> {
+    pub fn build(&mut self, apt: &AptManager) -> Result<(usize, Duration)> {
         let start = Instant::now();
         let mut count = 0;
 
@@ -36,7 +38,7 @@ impl SearchIndex {
         // Insert all packages
         let mut stmt = self.conn.prepare("INSERT INTO packages (name, description) VALUES (?, ?)")?;
 
-        for pkg in cache.packages(&PackageSort::default()) {
+        for pkg in apt.packages(&PackageSort::default()) {
             let name = pkg.name();
             let desc = pkg.candidate()
                 .and_then(|c| c.summary())

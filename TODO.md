@@ -45,7 +45,6 @@
 
 ### Code Quality
 - [ ] Make state transitions more explicit (typestate pattern or state machine)
-- [ ] Extract APT cache wrapper to separate `apt.rs` module
 
 ### Error Messages
 - [ ] Show "Resuming interrupted operation" when APT detects partial commit

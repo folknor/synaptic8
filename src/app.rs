@@ -1,22 +1,20 @@
 //! Application state and logic
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use color_eyre::Result;
 use ratatui::widgets::{ListState, TableState};
-use rust_apt::cache::{Cache, PackageSort};
-use rust_apt::progress::{AcquireProgress, InstallProgress};
-use rust_apt::{Package, Version};
+use rust_apt::cache::PackageSort;
 use zeroize::Zeroize;
 
+use crate::apt::AptManager;
 use crate::search::SearchIndex;
 use crate::types::*;
 
 /// Package management state - APT cache and marking state
 pub struct PackageState {
-    pub cache: Cache,
+    pub apt: AptManager,
     pub list: Vec<PackageInfo>,
-    pub user_marked: HashMap<String, bool>,
     pub pending: PendingChanges,
     pub mark_preview: MarkPreview,
     pub upgradable_count: usize,
@@ -92,15 +90,14 @@ pub struct App {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let cache = Cache::new::<&str>(&[])?;
+        let apt = AptManager::new()?;
         let mut filter_state = ListState::default();
         filter_state.select(Some(0));
 
         let mut app = Self {
             pkg: PackageState {
-                cache,
+                apt,
                 list: Vec::new(),
-                user_marked: HashMap::new(),
                 pending: PendingChanges::default(),
                 mark_preview: MarkPreview::default(),
                 upgradable_count: 0,
@@ -143,98 +140,20 @@ impl App {
         }
         self.details.cached_pkg_name = pkg_name.clone();
 
-        // Clear and recalculate deps
-        self.details.cached_deps.clear();
-        self.details.cached_rdeps.clear();
-
-        let pkg = match self.pkg.cache.get(&pkg_name) {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Get forward dependencies
-        if let Some(version) = pkg.candidate() {
-            if let Some(dependencies) = version.dependencies() {
-                for dep in dependencies {
-                    let dep_type = dep.dep_type().to_string();
-                    for base_dep in dep.iter() {
-                        self.details.cached_deps.push((dep_type.clone(), base_dep.name().to_string()));
-                    }
-                }
-            }
-        }
-
-        // Sort deps by type priority, then by name
-        fn dep_type_order(t: &str) -> u8 {
-            match t {
-                "PreDepends" => 0,
-                "Depends" => 1,
-                "Recommends" => 2,
-                "Suggests" => 3,
-                "Enhances" => 4,
-                _ => 5,
-            }
-        }
-        self.details.cached_deps.sort_by(|a, b| {
-            dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-
-        // Get reverse dependencies
-        let rdep_map = pkg.rdepends();
-        for (dep_type, deps) in rdep_map.iter() {
-            let type_str = format!("{:?}", dep_type);
-            for dep in deps {
-                for base_dep in dep.iter() {
-                    self.details.cached_rdeps.push((type_str.clone(), base_dep.name().to_string()));
-                }
-            }
-        }
-        // Sort rdeps by type priority, then by name
-        self.details.cached_rdeps.sort_by(|a, b| {
-            dep_type_order(&a.0).cmp(&dep_type_order(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        // Use AptManager to get dependencies
+        self.details.cached_deps = self.pkg.apt.get_dependencies(&pkg_name);
+        self.details.cached_rdeps = self.pkg.apt.get_reverse_dependencies(&pkg_name);
     }
 
     /// Get status for a package by name (for dep views)
     pub fn get_package_status(&self, name: &str) -> PackageStatus {
-        match self.pkg.cache.get(name) {
-            Some(pkg) => {
-                if pkg.marked_upgrade() {
-                    PackageStatus::MarkedForUpgrade
-                } else if pkg.marked_install() {
-                    if pkg.is_installed() {
-                        PackageStatus::MarkedForUpgrade
-                    } else if self.pkg.user_marked.get(name).copied().unwrap_or(false) {
-                        PackageStatus::Install
-                    } else {
-                        PackageStatus::AutoInstall
-                    }
-                } else if pkg.marked_delete() {
-                    if self.pkg.user_marked.get(name).copied().unwrap_or(false) {
-                        PackageStatus::Remove
-                    } else {
-                        PackageStatus::AutoRemove
-                    }
-                } else if pkg.is_installed() {
-                    if pkg.is_upgradable() {
-                        PackageStatus::Upgradable
-                    } else {
-                        PackageStatus::Installed
-                    }
-                } else {
-                    PackageStatus::NotInstalled
-                }
-            }
-            None => PackageStatus::NotInstalled,
-        }
+        self.pkg.apt.get_package_status(name)
     }
 
     pub fn ensure_search_index(&mut self) -> Result<()> {
         if self.search.index.is_none() {
             let mut index = SearchIndex::new()?;
-            let (count, duration) = index.build(&self.pkg.cache)?;
+            let (count, duration) = index.build(&self.pkg.apt)?;
             self.search.build_time = Some(duration);
             self.status_message = format!(
                 "Search index built: {} packages in {:.0}ms",
@@ -325,7 +244,7 @@ impl App {
             PackageSort::default()
         };
 
-        for pkg in self.pkg.cache.packages(&sort) {
+        for pkg in self.pkg.apt.packages(&sort) {
             // Apply category filter
             let matches_category = match self.ui.selected_filter {
                 FilterCategory::Upgradable => pkg.is_upgradable(),
@@ -344,7 +263,7 @@ impl App {
             };
 
             if matches_category && matches_search {
-                if let Some(info) = self.extract_package_info(&pkg) {
+                if let Some(info) = self.pkg.apt.extract_package_info(&pkg) {
                     // Track max column widths
                     self.col_widths.name = self.col_widths.name.max(info.name.len() as u16);
                     self.col_widths.section = self.col_widths.section.max(info.section.len() as u16);
@@ -366,63 +285,6 @@ impl App {
             if self.settings.sort_ascending { ord } else { ord.reverse() }
         };
         self.pkg.list.sort_by(cmp);
-    }
-
-    fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
-        let candidate = pkg.candidate()?;
-
-        let status = if pkg.marked_upgrade() {
-            // Upgrade is always for installed packages
-            PackageStatus::MarkedForUpgrade
-        } else if pkg.marked_install() {
-            if pkg.is_installed() {
-                // Installed package marked for install = upgrade
-                PackageStatus::MarkedForUpgrade
-            } else if self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false) {
-                PackageStatus::Install
-            } else {
-                PackageStatus::AutoInstall
-            }
-        } else if pkg.marked_delete() {
-            if self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false) {
-                PackageStatus::Remove
-            } else {
-                PackageStatus::AutoRemove
-            }
-        } else if pkg.is_installed() {
-            if pkg.is_upgradable() {
-                PackageStatus::Upgradable
-            } else {
-                PackageStatus::Installed
-            }
-        } else {
-            PackageStatus::NotInstalled
-        };
-
-        let installed_version = pkg
-            .installed()
-            .map(|v: Version| v.version().to_string())
-            .unwrap_or_default();
-
-        let installed_size = candidate.installed_size();
-        let download_size = candidate.size();
-
-        let description = candidate.summary().unwrap_or_default().to_string();
-        let section = candidate.section().unwrap_or("unknown").to_string();
-        let architecture = candidate.arch().to_string();
-
-        Some(PackageInfo {
-            name: pkg.name().to_string(),
-            status,
-            section,
-            installed_version,
-            candidate_version: candidate.version().to_string(),
-            installed_size,
-            download_size,
-            description,
-            architecture,
-            is_user_marked: self.pkg.user_marked.get(pkg.name()).copied().unwrap_or(false),
-        })
     }
 
     pub fn selected_package(&self) -> Option<&PackageInfo> {
@@ -533,22 +395,24 @@ impl App {
     }
 
     fn toggle_package(&mut self, name: &str) {
-        if let Some(pkg) = self.pkg.cache.get(name) {
+        if let Some(pkg) = self.pkg.apt.get(name) {
             let currently_marked = pkg.marked_install() || pkg.marked_upgrade();
+            let is_upgradable = pkg.is_upgradable();
+            let is_installed = pkg.is_installed();
+            drop(pkg); // Release borrow before mutating
 
             if currently_marked {
                 // Unmarking - just do it directly (no confirmation needed)
-                pkg.mark_keep();
-                self.pkg.user_marked.remove(name);
+                self.pkg.apt.mark_keep(name);
 
-                if let Err(e) = self.pkg.cache.resolve(true) {
+                if let Err(e) = self.pkg.apt.resolve() {
                     self.status_message = format!("Dependency error: {}", e);
                 }
 
                 self.calculate_pending_changes();
                 self.apply_current_filter();
                 self.update_status_message();
-            } else if pkg.is_upgradable() || !pkg.is_installed() {
+            } else if is_upgradable || !is_installed {
                 // Marking - preview additional changes first
                 self.preview_mark(name);
             }
@@ -611,25 +475,27 @@ impl App {
 
     /// Mark all multi-selected packages for install/upgrade
     fn mark_selected_packages(&mut self) {
-        // Collect package names to mark
+        // Collect package names that can be marked
         let packages_to_mark: Vec<String> = self.ui.multi_select.iter()
             .filter_map(|&idx| self.pkg.list.get(idx))
-            .map(|p| p.name.clone())
+            .filter_map(|p| {
+                // Check if package can be marked
+                if let Some(pkg) = self.pkg.apt.get(&p.name) {
+                    if pkg.is_upgradable() || !pkg.is_installed() {
+                        return Some(p.name.clone());
+                    }
+                }
+                None
+            })
             .collect();
 
-        // Mark each package
+        // Mark each package using AptManager
         for name in &packages_to_mark {
-            if let Some(pkg) = self.pkg.cache.get(name) {
-                if pkg.is_upgradable() || !pkg.is_installed() {
-                    pkg.mark_install(true, true);
-                    pkg.protect();
-                    self.pkg.user_marked.insert(name.clone(), true);
-                }
-            }
+            self.pkg.apt.mark_install(name);
         }
 
         // Resolve dependencies
-        if let Err(e) = self.pkg.cache.resolve(true) {
+        if let Err(e) = self.pkg.apt.resolve() {
             self.status_message = format!("Dependency error: {}", e);
         }
 
@@ -654,19 +520,21 @@ impl App {
     fn preview_mark(&mut self, name: &str) {
         // Get current state of all packages before marking
         let before: std::collections::HashSet<String> = self
-            .pkg.cache
-            .get_changes(false)
+            .pkg.apt
+            .get_changes()
             .map(|p| p.name().to_string())
             .collect();
 
         // Temporarily mark the package to see what would happen
-        if let Some(pkg) = self.pkg.cache.get(name) {
+        // Note: We use direct cache access here for the temporary mark
+        // since we'll undo it immediately after
+        if let Some(pkg) = self.pkg.apt.get(name) {
             pkg.mark_install(true, true);
             pkg.protect();
         }
 
         // Resolve dependencies
-        if let Err(e) = self.pkg.cache.resolve(true) {
+        if let Err(e) = self.pkg.apt.resolve() {
             self.status_message = format!("Dependency error: {}", e);
             // Undo and return
             self.restore_marks();
@@ -679,7 +547,7 @@ impl App {
         let mut additional_removes = Vec::new();
         let mut download_size: u64 = 0;
 
-        for pkg in self.pkg.cache.get_changes(false) {
+        for pkg in self.pkg.apt.get_changes() {
             let pkg_name = pkg.name().to_string();
 
             // Skip the package we're marking
@@ -740,24 +608,9 @@ impl App {
 
     /// Restore cache marks to match user_marked state
     fn restore_marks(&mut self) {
-        // Nuclear option: reload cache to guarantee clean state
-        if let Ok(new_cache) = Cache::new::<&str>(&[]) {
-            self.pkg.cache = new_cache;
-        }
-
-        // Re-apply only user-marked packages
-        for name in self.pkg.user_marked.keys() {
-            if let Some(pkg) = self.pkg.cache.get(name) {
-                pkg.mark_install(true, true);
-                pkg.protect();
-            }
-        }
-
-        // Resolve dependencies
-        if !self.pkg.user_marked.is_empty() {
-            if let Err(e) = self.pkg.cache.resolve(true) {
-                self.status_message = format!("Warning: dependency resolution issue: {}", e);
-            }
+        // Use AptManager's refresh to reload and reapply marks
+        if let Err(e) = self.pkg.apt.refresh() {
+            self.status_message = format!("Warning: cache refresh issue: {}", e);
         }
     }
 
@@ -765,17 +618,12 @@ impl App {
     pub fn confirm_mark(&mut self) {
         let name = self.pkg.mark_preview.package_name.clone();
 
-        // Now actually apply the mark
-        if let Some(pkg) = self.pkg.cache.get(&name) {
-            pkg.mark_install(true, true);
-            pkg.protect();
-        }
-        if let Err(e) = self.pkg.cache.resolve(true) {
+        // Now actually apply the mark using AptManager
+        self.pkg.apt.mark_install(&name);
+
+        if let Err(e) = self.pkg.apt.resolve() {
             self.status_message = format!("Warning: dependency resolution issue: {}", e);
         }
-
-        // Record in user_marked
-        self.pkg.user_marked.insert(name, true);
 
         self.pkg.mark_preview = MarkPreview::default();
         self.calculate_pending_changes();
@@ -793,15 +641,20 @@ impl App {
     }
 
     pub fn mark_all_upgrades(&mut self) {
-        for pkg in self.pkg.cache.packages(&PackageSort::default()) {
-            if pkg.is_upgradable() {
-                pkg.mark_install(true, true);
-                pkg.protect();
-                self.pkg.user_marked.insert(pkg.name().to_string(), true);
-            }
+        // Collect upgradable package names first
+        let upgradable: Vec<String> = self
+            .pkg.apt
+            .packages(&PackageSort::default())
+            .filter(|p| p.is_upgradable())
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Mark each package
+        for name in upgradable {
+            self.pkg.apt.mark_install(&name);
         }
 
-        if let Err(e) = self.pkg.cache.resolve(true) {
+        if let Err(e) = self.pkg.apt.resolve() {
             self.status_message = format!("Dependency error: {}", e);
         }
 
@@ -814,10 +667,18 @@ impl App {
     }
 
     pub fn unmark_all(&mut self) {
-        for pkg in self.pkg.cache.packages(&PackageSort::default()) {
-            pkg.mark_keep();
+        // Collect all package names first
+        let all_names: Vec<String> = self
+            .pkg.apt
+            .packages(&PackageSort::default())
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Mark each to keep
+        for name in all_names {
+            self.pkg.apt.mark_keep(&name);
         }
-        self.pkg.user_marked.clear();
+        self.pkg.apt.clear_user_marks();
 
         self.calculate_pending_changes();
         self.apply_current_filter();
@@ -825,43 +686,8 @@ impl App {
     }
 
     pub fn calculate_pending_changes(&mut self) {
-        self.pkg.pending = PendingChanges::default();
-
-        for pkg in self.pkg.cache.get_changes(false) {
-            let name = pkg.name().to_string();
-            let is_user = self.pkg.user_marked.get(&name).copied().unwrap_or(false);
-
-            if pkg.marked_install() {
-                if pkg.is_installed() {
-                    if is_user {
-                        self.pkg.pending.to_upgrade.push(name);
-                    } else {
-                        self.pkg.pending.auto_upgrade.push(name);
-                    }
-                } else {
-                    if is_user {
-                        self.pkg.pending.to_install.push(name);
-                    } else {
-                        self.pkg.pending.auto_install.push(name);
-                    }
-                }
-
-                if let Some(cand) = pkg.candidate() {
-                    self.pkg.pending.download_size += cand.size();
-                    self.pkg.pending.install_size_change += cand.installed_size() as i64;
-                }
-            } else if pkg.marked_delete() {
-                if is_user {
-                    self.pkg.pending.to_remove.push(name);
-                } else {
-                    self.pkg.pending.auto_remove.push(name);
-                }
-
-                if let Some(inst) = pkg.installed() {
-                    self.pkg.pending.install_size_change -= inst.installed_size() as i64;
-                }
-            }
-        }
+        // Delegate to AptManager
+        self.pkg.pending = self.pkg.apt.calculate_pending();
     }
 
     pub fn show_changes_preview(&mut self) {
@@ -893,11 +719,7 @@ impl App {
     }
 
     pub fn update_upgradable_count(&mut self) {
-        self.pkg.upgradable_count = self
-            .pkg.cache
-            .packages(&PackageSort::default())
-            .filter(|p| p.is_upgradable())
-            .count();
+        self.pkg.upgradable_count = self.pkg.apt.count_upgradable();
     }
 
     pub fn update_status_message(&mut self) {
@@ -1059,13 +881,7 @@ impl App {
         // This runs outside the TUI context
         println!("\n=== Applying changes ===\n");
 
-        let mut acquire_progress = AcquireProgress::apt();
-        let mut install_progress = InstallProgress::apt();
-
-        // Take ownership of cache for commit (it consumes self)
-        let cache = std::mem::replace(&mut self.pkg.cache, Cache::new::<&str>(&[])?);
-
-        match cache.commit(&mut acquire_progress, &mut install_progress) {
+        match self.pkg.apt.commit() {
             Ok(()) => {
                 println!("\n=== Changes applied successfully ===");
                 self.output_lines.push("Changes applied successfully.".to_string());
@@ -1081,8 +897,7 @@ impl App {
             }
         }
 
-        // Clear state after commit
-        self.pkg.user_marked.clear();
+        // Clear state after commit (user_marks cleared by apt.commit())
         self.pkg.pending = PendingChanges::default();
         self.search.index = None;
 
@@ -1180,7 +995,7 @@ impl App {
         }
 
         // Clear state after commit
-        self.pkg.user_marked.clear();
+        self.pkg.apt.clear_user_marks();
         self.pkg.pending = PendingChanges::default();
         self.search.index = None;
 
@@ -1194,8 +1009,7 @@ impl App {
             return Ok(()); // Not a fatal error, just can't refresh
         }
 
-        self.pkg.cache = Cache::new::<&str>(&[])?;
-        self.pkg.user_marked.clear();
+        self.pkg.apt.full_refresh()?;
         self.pkg.pending = PendingChanges::default();
         self.search.index = None; // Force rebuild on next search
         self.search.query.clear();

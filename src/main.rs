@@ -1,4 +1,5 @@
 mod app;
+mod apt;
 mod search;
 mod types;
 mod ui;
