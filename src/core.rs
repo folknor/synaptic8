@@ -388,30 +388,110 @@ impl PackageManager {
         self.pending = PendingChanges::default();
     }
 
-    /// Mark multiple packages (for visual mode)
-    pub fn mark_packages(&mut self, names: &[String]) -> Result<(), String> {
+    /// Preview marking multiple packages (for visual mode)
+    /// Returns PreviewResult indicating if confirmation is needed
+    pub fn preview_mark_packages(&mut self, names: &[String]) -> PreviewResult {
         // Filter to only markable packages
         let to_mark: Vec<String> = names.iter()
             .filter_map(|name| {
                 if let Some(pkg) = self.apt.get(name) {
                     if pkg.is_upgradable() || !pkg.is_installed() {
-                        return Some(name.clone());
+                        return Some(name.clone())
                     }
                 }
                 None
             })
             .collect();
 
+        if to_mark.is_empty() {
+            return PreviewResult::NoAdditionalChanges;
+        }
+
+        // Get current state before marking
+        let before: HashSet<String> = self.apt
+            .get_changes()
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Mark all selected packages
         for name in &to_mark {
+            if let Some(pkg) = self.apt.get(name) {
+                pkg.mark_install(true, true);
+                pkg.protect();
+            }
+        }
+
+        // Resolve dependencies
+        if let Err(e) = self.apt.resolve() {
+            self.restore_marks();
+            return PreviewResult::Error(format!("Dependency conflict: {}", format_apt_errors(&e)));
+        }
+
+        // Calculate what additional changes were pulled in
+        let to_mark_set: HashSet<&String> = to_mark.iter().collect();
+        let mut additional_installs = Vec::new();
+        let mut additional_upgrades = Vec::new();
+        let mut additional_removes = Vec::new();
+        let mut download_size: u64 = 0;
+
+        for pkg in self.apt.get_changes() {
+            let pkg_name = pkg.name().to_string();
+
+            // Add download size for all changes
+            if let Some(cand) = pkg.candidate() {
+                download_size += cand.size();
+            }
+
+            // Skip packages user explicitly selected or already marked
+            if to_mark_set.contains(&pkg_name) || before.contains(&pkg_name) {
+                continue;
+            }
+
+            if pkg.marked_install() || pkg.marked_upgrade() {
+                if pkg.is_installed() {
+                    additional_upgrades.push(pkg_name);
+                } else {
+                    additional_installs.push(pkg_name);
+                }
+            } else if pkg.marked_delete() {
+                additional_removes.push(pkg_name);
+            }
+        }
+
+        // Restore cache state
+        self.restore_marks();
+
+        // Store preview (use first package name as label, or "multiple")
+        let label = if to_mark.len() == 1 {
+            to_mark[0].clone()
+        } else {
+            format!("{} packages", to_mark.len())
+        };
+
+        self.mark_preview = MarkPreview {
+            package_name: label,
+            is_marking: true,
+            additional_installs,
+            additional_upgrades,
+            additional_removes,
+            download_size,
+        };
+
+        if self.mark_preview.has_additional_changes() {
+            PreviewResult::NeedsConfirmation
+        } else {
+            PreviewResult::NoAdditionalChanges
+        }
+    }
+
+    /// Confirm marking multiple packages after preview
+    pub fn confirm_mark_packages(&mut self, names: &[String]) {
+        for name in names {
             self.apt.mark_install(name);
         }
-
-        if let Err(e) = self.apt.resolve() {
-            return Err(format!("Dependency conflict: {}", format_apt_errors(&e)));
-        }
-
+        let _ = self.apt.resolve();
+        self.mark_preview = MarkPreview::default();
         self.pending = self.apt.calculate_pending();
-        Ok(())
     }
 
     /// Restore marks to user-marked state (fast, no cache reload)

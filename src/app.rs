@@ -9,7 +9,7 @@ use color_eyre::Result;
 use ratatui::widgets::{ListState, TableState};
 use zeroize::Zeroize;
 
-use crate::core::{PackageManager, ToggleResult};
+use crate::core::{PackageManager, PreviewResult, ToggleResult};
 use crate::types::*;
 
 /// UI widget state for the main views
@@ -50,6 +50,8 @@ pub struct ModalState {
     pub changes_scroll: u16,
     pub changelog_scroll: u16,
     pub changelog_content: Vec<String>,
+    /// Packages pending confirmation from visual mode
+    pub pending_visual_mark: Vec<String>,
 }
 
 /// TUI Application - wraps core PackageManager with UI state
@@ -261,13 +263,21 @@ impl App {
     }
 
     pub fn confirm_mark(&mut self) {
-        self.core.confirm_mark();
+        if !self.modals.pending_visual_mark.is_empty() {
+            // Visual mode confirmation
+            let packages = std::mem::take(&mut self.modals.pending_visual_mark);
+            self.core.confirm_mark_packages(&packages);
+        } else {
+            // Single package confirmation
+            self.core.confirm_mark();
+        }
         self.refresh_ui_state();
         self.update_status_message();
         self.state = AppState::Listing;
     }
 
     pub fn cancel_mark(&mut self) {
+        self.modals.pending_visual_mark.clear();
         self.core.cancel_mark();
         self.update_status_message();
         self.state = AppState::Listing;
@@ -343,16 +353,25 @@ impl App {
             .map(|p| p.name.clone())
             .collect();
 
-        if let Err(e) = self.core.mark_packages(&packages_to_mark) {
-            self.status_message = e;
-        }
-
         self.ui.multi_select.clear();
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
 
-        self.refresh_ui_state();
-        self.update_status_message();
+        match self.core.preview_mark_packages(&packages_to_mark) {
+            PreviewResult::NeedsConfirmation => {
+                self.modals.pending_visual_mark = packages_to_mark;
+                self.modals.mark_confirm_scroll = 0;
+                self.state = AppState::ShowingMarkConfirm;
+            }
+            PreviewResult::NoAdditionalChanges => {
+                self.core.confirm_mark_packages(&packages_to_mark);
+                self.refresh_ui_state();
+                self.update_status_message();
+            }
+            PreviewResult::Error(e) => {
+                self.status_message = e;
+            }
+        }
     }
 
     // === Navigation ===
