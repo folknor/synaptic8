@@ -1035,6 +1035,15 @@ impl ManagerState {
             .map(|p| p.id)
             .collect();
 
+        // Check if the target package is still marked (unmark failed)
+        let target_still_marked = marked_after.contains(&id);
+
+        if target_still_marked {
+            // Couldn't unmark - this is a dependency we can't trace back to user_intent
+            // Return NoChange to signal the UI should show a message
+            return ToggleResult::NoChange { package: id };
+        }
+
         let also_unmarked: Vec<PackageId> = marked_before.iter()
             .filter(|pkg_id| !marked_after.contains(pkg_id) && **pkg_id != id)
             .copied()

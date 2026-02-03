@@ -296,6 +296,15 @@ impl App {
                     self.state = AppState::ShowingMarkConfirm;
                 }
             }
+            ToggleResult::NoChange { package: _ } => {
+                // Couldn't unmark - it's a dependency we can't trace
+                // Tell user to unmark the original package instead
+                self.status_message = format!(
+                    "{} is a dependency - unmark the package that requires it",
+                    pkg_name
+                );
+                self.refresh_ui_state();
+            }
         }
     }
 

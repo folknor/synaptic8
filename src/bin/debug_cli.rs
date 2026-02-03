@@ -161,6 +161,11 @@ fn cmd_toggle(name: &str) -> Result<()> {
                 }
             }
         }
+        ToggleResult::NoChange { package } => {
+            let pkg_name = cache.fullname_of(*package).unwrap_or("(unknown)");
+            println!("=== Toggle {} (no change) ===", pkg_name);
+            println!("{} is a dependency - unmark the package that requires it", pkg_name);
+        }
     }
 
     // Save state

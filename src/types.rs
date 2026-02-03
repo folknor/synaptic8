@@ -326,6 +326,10 @@ pub enum ToggleResult {
         package: PackageId,
         also_unmarked: Vec<PackageId>,
     },
+    /// Toggle had no effect (e.g., dependency with untraceable origin)
+    NoChange {
+        package: PackageId,
+    },
 }
 
 /// Additional changes required when marking a single package
