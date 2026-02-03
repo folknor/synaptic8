@@ -353,10 +353,6 @@ impl App {
 
         self.refresh_ui_state();
         self.update_status_message();
-
-        if self.has_pending_changes() {
-            self.show_changes_preview();
-        }
     }
 
     // === Navigation ===
