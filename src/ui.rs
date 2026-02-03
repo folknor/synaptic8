@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::App;
-use crate::types::*;
+use synh8::types::*;
 
 pub fn ui(frame: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
@@ -20,13 +20,21 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
+    // Get download size from planned changes if available
+    let download_size = app.core.planned_changes()
+        .map(|changes| changes.iter().map(|c| c.download_size).sum::<u64>())
+        .unwrap_or(0);
+
     let changes_count = app.total_changes_count();
     let title_text = if changes_count > 0 {
         format!(
             " APT TUI │ {} changes │ {} download ",
             changes_count,
-            PackageInfo::size_str(app.core.pending.download_size)
+            PackageInfo::size_str(download_size)
         )
+    } else if app.core.has_marks() {
+        format!(" APT TUI │ {} marked (press 'u' to compute) ",
+            app.core.list().iter().filter(|p| app.core.is_user_marked(p.id)).count())
     } else {
         " APT TUI │ No changes pending ".to_string()
     };
@@ -50,7 +58,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_details_pane(frame, app, panes[2]);
         }
         AppState::ShowingMarkConfirm => {
-            // Render the package list in background
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -64,8 +71,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_package_table(frame, app, panes[1]);
             render_details_pane(frame, app, panes[2]);
 
-            // Overlay the confirmation modal
-            render_mark_confirm_modal(frame, app, main_chunks[1]);
+            // Render the mark preview modal on top
+            render_mark_preview_modal(frame, app, main_chunks[1]);
         }
         AppState::ShowingChanges => {
             render_changes_modal(frame, app, main_chunks[1]);
@@ -77,7 +84,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_settings_view(frame, app, main_chunks[1]);
         }
         AppState::ConfirmExit => {
-            // Render the package list in background
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -91,7 +97,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_package_table(frame, app, panes[1]);
             render_details_pane(frame, app, panes[2]);
 
-            // Overlay the exit confirmation modal
             render_exit_confirm_modal(frame, app, main_chunks[1]);
         }
         AppState::EnteringPassword => {
@@ -118,16 +123,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
     };
+
     let status_text = match app.state {
-        AppState::Searching => format!("/{}_", app.core.search.query),
-        AppState::ShowingMarkConfirm => format!(
-            "Mark '{}' requires additional changes",
-            app.core.mark_preview.package_name
-        ),
+        AppState::Searching => format!("/{}_", app.core.search_query()),
         _ => {
-            // Show active search filter in status if present
-            if app.core.search.results.is_some() {
-                format!("[Search: {}] {}", app.core.search.query, app.status_message)
+            if app.core.search_result_count().is_some() {
+                format!("[Search: {}] {}", app.core.search_query(), app.status_message)
             } else {
                 app.status_message.clone()
             }
@@ -142,7 +143,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Listing => {
             if app.ui.visual_mode {
                 "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
-            } else if app.core.search.results.is_some() {
+            } else if app.core.search_result_count().is_some() {
                 "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ q:Quit"
             } else {
                 "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ q:Quit"
@@ -167,16 +168,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.ui.focused_pane == FocusedPane::Filters;
 
-    // Split into filters and legend
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(7)])
+        .constraints([Constraint::Min(7), Constraint::Length(9)])
         .split(area);
 
     let items: Vec<ListItem> = FilterCategory::all()
         .iter()
         .map(|cat| {
-            let style = if *cat == app.core.selected_filter {
+            let style = if *cat == app.core.selected_filter() {
                 Style::default().fg(Color::Yellow).bold()
             } else {
                 Style::default()
@@ -203,19 +203,26 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(list, chunks[0], &mut app.ui.filter_state.clone());
 
-    // Legend
     let legend = vec![
         Line::from(vec![
             Span::styled("↑", Style::default().fg(Color::Yellow)),
-            Span::raw(" Upg avail"),
+            Span::raw(" Upgradable"),
         ]),
         Line::from(vec![
             Span::styled("↑", Style::default().fg(Color::Green)),
-            Span::raw(" Upgrading"),
+            Span::raw(" Upgrade"),
+        ]),
+        Line::from(vec![
+            Span::styled("↑", Style::default().fg(Color::Cyan)),
+            Span::raw(" Auto-upg"),
         ]),
         Line::from(vec![
             Span::styled("+", Style::default().fg(Color::Green)),
             Span::raw(" Install"),
+        ]),
+        Line::from(vec![
+            Span::styled("+", Style::default().fg(Color::Cyan)),
+            Span::raw(" Auto-inst"),
         ]),
         Line::from(vec![
             Span::styled("-", Style::default().fg(Color::Red)),
@@ -248,12 +255,13 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let header = Row::new(header_cells).height(1);
 
-    let rows: Vec<Row> = app
-        .core.list
+    let list = app.core.list();
+    let rows: Vec<Row> = list
         .iter()
         .enumerate()
         .map(|(idx, pkg)| {
             let is_multi_selected = app.ui.multi_select.contains(&idx);
+            let is_user_marked = app.core.is_user_marked(pkg.id);
 
             let cells: Vec<Cell> = visible_cols
                 .iter()
@@ -261,12 +269,14 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     Column::Status => Cell::from(pkg.status.symbol())
                         .style(Style::default().fg(pkg.status.color())),
                     Column::Name => {
-                        let style = if pkg.is_user_marked {
+                        let style = if is_user_marked {
                             Style::default().fg(Color::White).bold()
                         } else {
                             Style::default()
                         };
-                        Cell::from(pkg.display_name.as_str()).style(style)
+                        // Strip native arch suffix for cleaner display
+                        let display_name = app.core.cache().display_name(&pkg.name);
+                        Cell::from(display_name).style(style)
                     }
                     Column::Section => Cell::from(pkg.section.as_str()),
                     Column::InstalledVersion => {
@@ -303,7 +313,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .header(header)
         .block(
             Block::default()
-                .title(format!(" Packages ({}) ", app.core.list.len()))
+                .title(format!(" Packages ({}) ", list.len()))
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
@@ -312,12 +322,12 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(table, area, &mut app.ui.table_state);
 
-    if !app.core.list.is_empty() {
+    if !list.is_empty() {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
 
-        let mut scrollbar_state = ScrollbarState::new(app.core.list.len())
+        let mut scrollbar_state = ScrollbarState::new(list.len())
             .position(app.ui.table_state.selected().unwrap_or(0));
 
         let scrollbar_area = Rect {
@@ -339,7 +349,6 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    // Tab header
     let info_style = if app.details.tab == DetailsTab::Info {
         Style::default().fg(Color::Yellow).bold()
     } else {
@@ -369,12 +378,13 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if let Some(pkg) = app.selected_package() {
+        let display_name = app.core.cache().display_name(&pkg.name);
         match app.details.tab {
             DetailsTab::Info => {
                 content.extend(vec![
                     Line::from(vec![
                         Span::styled("Package: ", Style::default().fg(Color::Cyan).bold()),
-                        Span::raw(&pkg.display_name),
+                        Span::raw(display_name),
                     ]),
                     Line::from(""),
                     Line::from(vec![
@@ -427,7 +437,6 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
-                    // Group by dep type
                     let mut current_type = String::new();
 
                     for (dep_type, target) in &app.details.cached_deps {
@@ -436,20 +445,14 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                                 content.push(Line::from(""));
                             }
                             content.push(Line::from(Span::styled(
-                                format!("{}:", dep_type),
+                                format!("{dep_type}:"),
                                 Style::default().fg(Color::Cyan).bold(),
                             )));
                             current_type = dep_type.clone();
                         }
 
-                        let status = app.get_package_status(target);
-                        let symbol = status.symbol();
-                        let color = status.color();
-
                         content.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
-                            Span::raw(" "),
                             Span::raw(target.as_str()),
                         ]));
                     }
@@ -468,7 +471,6 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                     )));
                     content.push(Line::from(""));
 
-                    // Group by dep type
                     let mut current_type = String::new();
 
                     for (dep_type, pkg_name) in &app.details.cached_rdeps {
@@ -477,20 +479,14 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                                 content.push(Line::from(""));
                             }
                             content.push(Line::from(Span::styled(
-                                format!("{}:", dep_type),
+                                format!("{dep_type}:"),
                                 Style::default().fg(Color::Cyan).bold(),
                             )));
                             current_type = dep_type.clone();
                         }
 
-                        let status = app.get_package_status(pkg_name);
-                        let symbol = status.symbol();
-                        let color = status.color();
-
                         content.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(format!("{:1}", symbol), Style::default().fg(color)),
-                            Span::raw(" "),
                             Span::raw(pkg_name.as_str()),
                         ]));
                     }
@@ -523,125 +519,6 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(details, area);
 }
 
-fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
-    let preview = &app.core.mark_preview;
-    let is_marking = preview.is_marking;
-
-    // Build content first to calculate height
-    let header_text = if is_marking {
-        "Marking this package requires additional changes:"
-    } else {
-        "Unmarking this package will also affect:"
-    };
-
-    let mut lines = vec![
-        Line::from(Span::styled(header_text, Style::default().bold())),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Package: ", Style::default().fg(Color::Cyan)),
-            Span::styled(&preview.package_name, Style::default().bold()),
-        ]),
-        Line::from(""),
-    ];
-
-    if !preview.additional_upgrades.is_empty() {
-        let label = if is_marking {
-            format!("The following {} packages will be UPGRADED:", preview.additional_upgrades.len())
-        } else {
-            format!("The following {} upgrades will be CANCELLED:", preview.additional_upgrades.len())
-        };
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(Color::Yellow).bold(),
-        )));
-        for name in &preview.additional_upgrades {
-            lines.push(Line::from(Span::styled(
-                format!("  ↑ {}", name),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-
-    if !preview.additional_installs.is_empty() {
-        let label = if is_marking {
-            format!("The following {} packages will be INSTALLED:", preview.additional_installs.len())
-        } else {
-            format!("The following {} installs will be CANCELLED:", preview.additional_installs.len())
-        };
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(if is_marking { Color::Green } else { Color::Yellow }).bold(),
-        )));
-        for name in &preview.additional_installs {
-            lines.push(Line::from(Span::styled(
-                format!("  {} {}", if is_marking { "+" } else { "×" }, name),
-                Style::default().fg(if is_marking { Color::Green } else { Color::Yellow }),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-
-    if !preview.additional_removes.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("The following {} packages will be REMOVED:", preview.additional_removes.len()),
-            Style::default().fg(Color::Red).bold(),
-        )));
-        for name in &preview.additional_removes {
-            lines.push(Line::from(Span::styled(
-                format!("  - {}", name),
-                Style::default().fg(Color::Red),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-
-    if is_marking {
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            "Total download: {}",
-            PackageInfo::size_str(preview.download_size)
-        )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "y/Enter: Accept │ n/Esc: Cancel │ ↑↓: Scroll",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    // Calculate max package name width for modal sizing
-    let max_name_len = preview.additional_upgrades.iter()
-        .chain(preview.additional_installs.iter())
-        .chain(preview.additional_removes.iter())
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(0);
-
-    // Calculate modal size based on content
-    let content_height = lines.len() as u16 + 2; // +2 for borders
-    // Width: at least 50, up to content width + padding, max 80% of screen
-    let content_width = (max_name_len + 10).max(45) as u16;
-    let modal_width = content_width.min(area.width * 8 / 10);
-    let modal_height = content_height.min(area.height.saturating_sub(4));
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-    frame.render_widget(Clear, modal_area);
-
-    let modal = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Additional Changes Required ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .scroll((app.modals.mark_confirm_scroll, 0))
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(modal, modal_area);
-}
-
 fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
     let modal_width = 60.min(area.width.saturating_sub(4));
     let modal_height = 20.min(area.height.saturating_sub(2));
@@ -659,99 +536,122 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
     ];
 
-    if !app.core.pending.to_upgrade.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("UPGRADE ({}):", app.core.pending.to_upgrade.len()),
-            Style::default().fg(Color::Yellow).bold(),
-        )));
-        for name in &app.core.pending.to_upgrade {
-            lines.push(Line::from(format!("  ↑ {}", name)));
+    // Get planned changes - derive names from PackageId using cache
+    if let Some(changes) = app.core.planned_changes() {
+        let cache = app.core.cache();
+
+        // Helper to get display name from PackageId (strips native arch suffix)
+        let get_name = |c: &PlannedChange| -> String {
+            cache.fullname_of(c.package)
+                .map(|name| cache.display_name(name).to_string())
+                .unwrap_or_else(|| format!("(unknown:{})", c.package.index()))
+        };
+
+        // Group by action and reason
+        let user_upgrades: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested)
+            .collect();
+        let user_installs: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested)
+            .collect();
+        let dep_upgrades: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::Dependency)
+            .collect();
+        let dep_installs: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::Dependency)
+            .collect();
+        let user_removes: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::UserRequested)
+            .collect();
+        let auto_removes: Vec<_> = changes.iter()
+            .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove)
+            .collect();
+
+        if !user_upgrades.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("UPGRADE ({}):", user_upgrades.len()),
+                Style::default().fg(Color::Yellow).bold(),
+            )));
+            for c in &user_upgrades {
+                lines.push(Line::from(format!("  ↑ {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
-    }
 
-    if !app.core.pending.to_install.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("INSTALL ({}):", app.core.pending.to_install.len()),
-            Style::default().fg(Color::Green).bold(),
-        )));
-        for name in &app.core.pending.to_install {
-            lines.push(Line::from(format!("  + {}", name)));
+        if !user_installs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("INSTALL ({}):", user_installs.len()),
+                Style::default().fg(Color::Green).bold(),
+            )));
+            for c in &user_installs {
+                lines.push(Line::from(format!("  + {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
-    }
 
-    if !app.core.pending.auto_upgrade.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "AUTO-UPGRADE (dependencies) ({}):",
-                app.core.pending.auto_upgrade.len()
-            ),
-            Style::default().fg(Color::Cyan).bold(),
-        )));
-        for name in &app.core.pending.auto_upgrade {
-            lines.push(Line::from(format!("  ↑ {}", name)));
+        if !dep_upgrades.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("AUTO-UPGRADE (dependencies) ({}):", dep_upgrades.len()),
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            for c in &dep_upgrades {
+                lines.push(Line::from(format!("  ↑ {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
-    }
 
-    if !app.core.pending.auto_install.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "AUTO-INSTALL (dependencies) ({}):",
-                app.core.pending.auto_install.len()
-            ),
-            Style::default().fg(Color::Cyan).bold(),
-        )));
-        for name in &app.core.pending.auto_install {
-            lines.push(Line::from(format!("  + {}", name)));
+        if !dep_installs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("AUTO-INSTALL (dependencies) ({}):", dep_installs.len()),
+                Style::default().fg(Color::Cyan).bold(),
+            )));
+            for c in &dep_installs {
+                lines.push(Line::from(format!("  + {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
-    }
 
-    if !app.core.pending.to_remove.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("REMOVE ({}):", app.core.pending.to_remove.len()),
-            Style::default().fg(Color::Red).bold(),
-        )));
-        for name in &app.core.pending.to_remove {
-            lines.push(Line::from(format!("  - {}", name)));
+        if !user_removes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("REMOVE ({}):", user_removes.len()),
+                Style::default().fg(Color::Red).bold(),
+            )));
+            for c in &user_removes {
+                lines.push(Line::from(format!("  - {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
-    }
 
-    if !app.core.pending.auto_remove.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "AUTO-REMOVE (no longer needed) ({}):",
-                app.core.pending.auto_remove.len()
-            ),
-            Style::default().fg(Color::Magenta).bold(),
-        )));
-        for name in &app.core.pending.auto_remove {
-            lines.push(Line::from(format!("  X {}", name)));
+        if !auto_removes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("AUTO-REMOVE (no longer needed) ({}):", auto_removes.len()),
+                Style::default().fg(Color::Magenta).bold(),
+            )));
+            for c in &auto_removes {
+                lines.push(Line::from(format!("  X {}", get_name(c))));
+            }
+            lines.push(Line::from(""));
         }
+
+        // Download and size info
+        let download_size: u64 = changes.iter().map(|c| c.download_size).sum();
+        let size_change: i64 = changes.iter().map(|c| c.size_change).sum();
+
         lines.push(Line::from(""));
-    }
+        lines.push(Line::from(format!(
+            "Download size: {}",
+            PackageInfo::size_str(download_size)
+        )));
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Download size: {}",
-        PackageInfo::size_str(app.core.pending.download_size)
-    )));
-
-    let size_change = if app.core.pending.install_size_change >= 0 {
-        format!(
-            "+{}",
-            PackageInfo::size_str(app.core.pending.install_size_change as u64)
-        )
+        let size_change_str = if size_change >= 0 {
+            format!("+{}", PackageInfo::size_str(size_change as u64))
+        } else {
+            format!("-{}", PackageInfo::size_str((-size_change) as u64))
+        };
+        lines.push(Line::from(format!("Disk space change: {size_change_str}")));
     } else {
-        format!(
-            "-{}",
-            PackageInfo::size_str((-app.core.pending.install_size_change) as u64)
-        )
-    };
-    lines.push(Line::from(format!("Disk space change: {}", size_change)));
+        lines.push(Line::from("No changes computed"));
+    }
 
     let modal = Paragraph::new(lines)
         .block(
@@ -781,7 +681,7 @@ fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let changelog = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(format!(" Changelog: {} ", pkg_name))
+                .title(format!(" Changelog: {pkg_name} "))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -801,76 +701,39 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
         ("Download size column", app.settings.show_download_size_column),
     ];
 
-    let mut content = vec![
-        Line::from(Span::styled(
-            "Column Visibility",
-            Style::default().fg(Color::Cyan).bold(),
-        )),
-        Line::from(""),
-    ];
+    let mut items: Vec<ListItem> = column_items
+        .iter()
+        .enumerate()
+        .map(|(idx, (label, enabled))| {
+            let checkbox = if *enabled { "[X]" } else { "[ ]" };
+            let text = format!("{checkbox} {label}");
+            let style = if idx == app.settings_selection {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
 
-    // Column toggles (items 0-5)
-    for (i, (name, enabled)) in column_items.iter().enumerate() {
-        let checkbox = if *enabled { "[✓]" } else { "[ ]" };
-        let style = if i == app.settings_selection {
-            Style::default().fg(Color::Yellow).bold()
-        } else {
-            Style::default()
-        };
-        content.push(Line::from(vec![
-            Span::styled(
-                if i == app.settings_selection { "▶ " } else { "  " },
-                style,
-            ),
-            Span::styled(checkbox, if *enabled { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
-            Span::raw(" "),
-            Span::styled(*name, style),
-        ]));
-    }
-
-    // Sort section
-    content.push(Line::from(""));
-    content.push(Line::from(Span::styled(
-        "Sorting",
-        Style::default().fg(Color::Cyan).bold(),
-    )));
-    content.push(Line::from(""));
-
-    // Sort by (item 6)
+    // Add sort options
+    items.push(ListItem::new(""));
     let sort_style = if app.settings_selection == 6 {
-        Style::default().fg(Color::Yellow).bold()
+        Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
     };
-    content.push(Line::from(vec![
-        Span::styled(
-            if app.settings_selection == 6 { "▶ " } else { "  " },
-            sort_style,
-        ),
-        Span::styled("Sort by: ", sort_style),
-        Span::styled(
-            app.settings.sort_by.label(),
-            Style::default().fg(Color::Green),
-        ),
-    ]));
+    items.push(ListItem::new(format!("Sort by: {}", app.settings.sort_by.label())).style(sort_style));
 
-    // Sort direction (item 7)
-    let dir_style = if app.settings_selection == 7 {
-        Style::default().fg(Color::Yellow).bold()
+    let order_style = if app.settings_selection == 7 {
+        Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
     };
-    let dir_label = if app.settings.sort_ascending { "Ascending" } else { "Descending" };
-    content.push(Line::from(vec![
-        Span::styled(
-            if app.settings_selection == 7 { "▶ " } else { "  " },
-            dir_style,
-        ),
-        Span::styled("Direction: ", dir_style),
-        Span::styled(dir_label, Style::default().fg(Color::Green)),
-    ]));
+    let order = if app.settings.sort_ascending { "Ascending" } else { "Descending" };
+    items.push(ListItem::new(format!("Sort order: {order}")).style(order_style));
 
-    let settings = Paragraph::new(content)
+    let settings_list = List::new(items)
         .block(
             Block::default()
                 .title(" Settings ")
@@ -878,10 +741,129 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 .border_style(Style::default().fg(Color::Yellow)),
         );
 
-    frame.render_widget(settings, area);
+    frame.render_widget(settings_list, area);
 }
 
-fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
+fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(ref preview) = app.mark_preview else {
+        return;
+    };
+
+    let modal_width = 60.min(area.width.saturating_sub(4));
+    let modal_height = 20.min(area.height.saturating_sub(4));
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let mut lines = Vec::new();
+
+    if preview.is_marking {
+        // MARK operation
+        let action = if preview.is_upgrade { "upgrade" } else { "install" };
+        lines.push(Line::from(Span::styled(
+            format!("Mark '{}' for {}?", preview.package_name, action),
+            Style::default().bold(),
+        )));
+        lines.push(Line::from(""));
+
+        if !preview.additional_installs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Will install {} additional packages:", preview.additional_installs.len()),
+                Style::default().fg(Color::Green),
+            )));
+            for name in &preview.additional_installs {
+                lines.push(Line::from(format!("  + {name}")));
+            }
+            lines.push(Line::from(""));
+        }
+
+        if !preview.additional_upgrades.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Will upgrade {} packages:", preview.additional_upgrades.len()),
+                Style::default().fg(Color::Yellow),
+            )));
+            for name in &preview.additional_upgrades {
+                lines.push(Line::from(format!("  ^ {name}")));
+            }
+            lines.push(Line::from(""));
+        }
+
+        if !preview.additional_removes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Will remove {} packages:", preview.additional_removes.len()),
+                Style::default().fg(Color::Red),
+            )));
+            for name in &preview.additional_removes {
+                lines.push(Line::from(format!("  - {name}")));
+            }
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(Span::styled(
+            format!("Download size: {}", PackageInfo::size_str(preview.download_size)),
+            Style::default().fg(Color::Cyan),
+        )));
+    } else {
+        // UNMARK operation
+        lines.push(Line::from(Span::styled(
+            format!("Unmark '{}'?", preview.package_name),
+            Style::default().bold(),
+        )));
+        lines.push(Line::from(""));
+
+        // additional_upgrades is repurposed to hold "also unmarked" packages
+        if !preview.additional_upgrades.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("This will also unmark {} packages:", preview.additional_upgrades.len()),
+                Style::default().fg(Color::Yellow),
+            )));
+            for name in &preview.additional_upgrades {
+                lines.push(Line::from(format!("  {name}")));
+            }
+        }
+    }
+
+    // Apply scroll offset
+    let visible_lines: Vec<Line> = lines
+        .into_iter()
+        .skip(app.mark_preview_scroll)
+        .collect();
+
+    let title = if preview.is_marking {
+        " Confirm Package Mark "
+    } else {
+        " Confirm Package Unmark "
+    };
+
+    let modal = Paragraph::new(visible_lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(modal, modal_area);
+
+    // Hint at bottom
+    let hint_area = Rect::new(
+        modal_area.x,
+        modal_area.y + modal_area.height - 1,
+        modal_area.width,
+        1,
+    );
+    let hint = Paragraph::new(Span::styled(
+        " y/Enter: Confirm │ n/Esc: Cancel │ j/k: Scroll ",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(Alignment::Center);
+    frame.render_widget(hint, hint_area);
+}
+
+fn render_exit_confirm_modal(frame: &mut Frame, _app: &App, area: Rect) {
     let modal_width = 50.min(area.width.saturating_sub(4));
     let modal_height = 7;
     let modal_x = area.x + (area.width - modal_width) / 2;
@@ -890,66 +872,65 @@ fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Clear, modal_area);
 
-    // Show asterisks for password
-    let password_display = "*".repeat(app.sudo_password.len());
-
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter sudo password:",
-            Style::default().bold(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("> "),
-            Span::styled(&password_display, Style::default().fg(Color::Yellow)),
-            Span::styled("_", Style::default().fg(Color::Yellow)),
-        ]),
-    ];
-
-    let modal = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(" Authentication Required ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-
-    frame.render_widget(modal, modal_area);
-}
-
-fn render_exit_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
-    let modal_width = 50.min(area.width.saturating_sub(4));
-    let modal_height = 9;
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-    frame.render_widget(Clear, modal_area);
-
-    let changes = app.total_changes_count();
-    let content = vec![
+    let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             "You have unsaved changes!",
             Style::default().fg(Color::Red).bold(),
         )),
         Line::from(""),
-        Line::from(format!("{} pending changes will be lost.", changes)),
+        Line::from("Really quit without applying?"),
         Line::from(""),
         Line::from(Span::styled(
-            "Are you sure you want to quit?",
-            Style::default().bold(),
+            "y/Enter: Quit │ n/Esc: Cancel",
+            Style::default().fg(Color::DarkGray),
         )),
-        Line::from(""),
     ];
 
-    let modal = Paragraph::new(content)
+    let modal = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(" Confirm Exit ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red)),
+        )
+        .alignment(Alignment::Center);
+
+    frame.render_widget(modal, modal_area);
+}
+
+fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
+    let modal_width = 50.min(area.width.saturating_sub(4));
+    let modal_height = 8;
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let password_display = "*".repeat(app.sudo_password.len());
+    let lines = vec![
+        Line::from(""),
+        Line::from("Root privileges required."),
+        Line::from("Enter sudo password:"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("[{password_display}]"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: Submit │ Esc: Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Authentication ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
         )
         .alignment(Alignment::Center);
 

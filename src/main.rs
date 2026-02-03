@@ -1,8 +1,4 @@
 mod app;
-mod apt;
-mod core;
-mod search;
-mod types;
 mod ui;
 
 use std::io;
@@ -18,7 +14,7 @@ use ratatui::prelude::*;
 use zeroize::Zeroize;
 
 use app::App;
-use types::*;
+use synh8::types::*;
 use ui::ui;
 
 fn main() -> Result<()> {
@@ -33,8 +29,8 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(std::time::Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -49,7 +45,7 @@ fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            app.cycle_focus_back()
+                            app.cycle_focus_back();
                         }
                         KeyCode::Tab => app.cycle_focus(),
                         KeyCode::BackTab => app.cycle_focus_back(),
@@ -58,10 +54,9 @@ fn main() -> Result<()> {
                             if app.ui.visual_mode {
                                 // Cancel visual mode
                                 app.cancel_visual_mode();
-                            } else if app.core.search.results.is_some() {
+                            } else if app.core.has_search_results() {
                                 // Clear search filter
-                                app.core.search.query.clear();
-                                app.core.search.results = None;
+                                app.core.clear_search();
                                 app.apply_current_filter();
                                 app.update_status_message();
                             }
@@ -73,7 +68,7 @@ fn main() -> Result<()> {
                                 app.update_visual_selection();
                             }
                             FocusedPane::Details => {
-                                app.details.scroll = app.details.scroll.saturating_sub(1)
+                                app.details.scroll = app.details.scroll.saturating_sub(1);
                             }
                         },
                         KeyCode::Down | KeyCode::Char('j') => match app.ui.focused_pane {
@@ -83,7 +78,7 @@ fn main() -> Result<()> {
                                 app.update_visual_selection();
                             }
                             FocusedPane::Details => {
-                                app.details.scroll = app.details.scroll.saturating_add(1)
+                                app.details.scroll = app.details.scroll.saturating_add(1);
                             }
                         },
                         KeyCode::PageDown => {
@@ -119,7 +114,7 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Char('v') => app.start_visual_mode(),
                         KeyCode::Char('d') | KeyCode::Left | KeyCode::Char('h') => {
-                            app.prev_details_tab()
+                            app.prev_details_tab();
                         }
                         KeyCode::Right | KeyCode::Char('l') => app.next_details_tab(),
                         KeyCode::Char('c') => app.show_changelog(),
@@ -129,7 +124,7 @@ fn main() -> Result<()> {
                         KeyCode::Char('N') => app.unmark_all(),
                         KeyCode::Char('r') => {
                             if let Err(e) = app.refresh_cache() {
-                                app.status_message = format!("Refresh failed: {}", e);
+                                app.status_message = format!("Refresh failed: {e}");
                             }
                         }
                         _ => {}
@@ -138,18 +133,18 @@ fn main() -> Result<()> {
                         KeyCode::Esc => app.cancel_search(),
                         KeyCode::Enter => app.confirm_search(),
                         KeyCode::Backspace => {
-                            app.core.search.query.pop();
+                            app.core.search_query_pop();
                             app.execute_search();
                         }
                         KeyCode::Char(c) => {
-                            app.core.search.query.push(c);
+                            app.core.search_query_push(c);
                             app.execute_search();
                         }
                         _ => {}
                     },
                     AppState::ShowingMarkConfirm => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
-                            app.confirm_mark()
+                            app.confirm_mark();
                         }
                         KeyCode::Char('n') | KeyCode::Esc => app.cancel_mark(),
                         KeyCode::Up | KeyCode::Char('k') => app.scroll_mark_confirm(-1),
@@ -170,7 +165,7 @@ fn main() -> Result<()> {
                                     io::stdout().execute(LeaveAlternateScreen)?;
 
                                     if let Err(e) = app.commit_changes() {
-                                        eprintln!("Error: {}", e);
+                                        eprintln!("Error: {e}");
                                     }
 
                                     // Return to TUI
@@ -217,7 +212,7 @@ fn main() -> Result<()> {
                             io::stdout().execute(LeaveAlternateScreen)?;
 
                             if let Err(e) = app.commit_with_sudo() {
-                                eprintln!("Error: {}", e);
+                                eprintln!("Error: {e}");
                             }
 
                             // Return to TUI
@@ -259,14 +254,13 @@ fn main() -> Result<()> {
                         KeyCode::Char('r') => {
                             app.state = AppState::Listing;
                             if let Err(e) = app.refresh_cache() {
-                                app.status_message = format!("Refresh failed: {}", e);
+                                app.status_message = format!("Refresh failed: {e}");
                             }
                         }
                         _ => {}
                     },
                 }
             }
-        }
     }
 
     disable_raw_mode()?;

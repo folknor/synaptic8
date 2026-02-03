@@ -7,7 +7,7 @@ use color_eyre::Result;
 use rust_apt::cache::PackageSort;
 use rusqlite::{Connection, params};
 
-use crate::apt::AptManager;
+use crate::apt::AptCache;
 
 /// SQLite FTS5 search index for packages
 pub struct SearchIndex {
@@ -25,7 +25,7 @@ impl SearchIndex {
     }
 
     /// Build the search index from the APT cache
-    pub fn build(&mut self, apt: &AptManager) -> Result<(usize, Duration)> {
+    pub fn build(&mut self, apt: &AptCache) -> Result<(usize, Duration)> {
         let start = Instant::now();
         let mut count = 0;
 

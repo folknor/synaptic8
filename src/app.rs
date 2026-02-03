@@ -1,7 +1,7 @@
 //! TUI application state and logic
 //!
 //! This module contains TUI-specific state and acts as an adapter between
-//! the core business logic (PackageManager) and the ratatui UI.
+//! the core business logic (ManagerState) and the ratatui UI.
 
 use std::collections::HashSet;
 
@@ -9,8 +9,8 @@ use color_eyre::Result;
 use ratatui::widgets::{ListState, TableState};
 use zeroize::Zeroize;
 
-use crate::core::{PackageManager, PreviewResult, ToggleResult};
-use crate::types::*;
+use synh8::core::{ManagerState, is_root, check_apt_lock};
+use synh8::types::*;
 
 /// UI widget state for the main views
 pub struct UiState {
@@ -50,14 +50,12 @@ pub struct ModalState {
     pub changes_scroll: u16,
     pub changelog_scroll: u16,
     pub changelog_content: Vec<String>,
-    /// Packages pending confirmation from visual mode
-    pub pending_visual_mark: Vec<String>,
 }
 
-/// TUI Application - wraps core PackageManager with UI state
+/// TUI Application - wraps ManagerState with UI state
 pub struct App {
-    /// Core business logic (UI-agnostic)
-    pub core: PackageManager,
+    /// Core business logic (typestate package manager wrapped in enum)
+    pub core: ManagerState,
 
     /// TUI-specific state
     pub ui: UiState,
@@ -70,11 +68,15 @@ pub struct App {
     pub status_message: String,
     pub output_lines: Vec<String>,
     pub sudo_password: String,
+
+    /// Mark preview state (shown before confirming package mark)
+    pub mark_preview: Option<MarkPreview>,
+    pub mark_preview_scroll: usize,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
-        let core = PackageManager::new()?;
+        let core = ManagerState::new()?;
         let mut filter_state = ListState::default();
         filter_state.select(Some(0));
 
@@ -98,6 +100,8 @@ impl App {
             status_message: String::from("Loading..."),
             output_lines: Vec::new(),
             sudo_password: String::new(),
+            mark_preview: None,
+            mark_preview_scroll: 0,
         };
 
         // Sync sort settings from UI settings to core
@@ -122,7 +126,7 @@ impl App {
         self.ui.visual_mode = false;
 
         let new_idx = package_name
-            .and_then(|name| self.core.list.iter().position(|p| p.name == name))
+            .and_then(|name| self.core.list().iter().position(|p| p.name == name))
             .unwrap_or(0);
 
         self.ui.table_state.select(if self.core.package_count() > 0 {
@@ -145,18 +149,17 @@ impl App {
             .and_then(|i| self.core.get_package(i))
     }
 
-    pub fn get_package_status(&self, name: &str) -> PackageStatus {
-        self.core.get_package_status(name)
-    }
-
     #[must_use]
     pub fn has_pending_changes(&self) -> bool {
-        self.core.has_pending_changes()
+        self.core.has_marks()
     }
 
     #[must_use]
     pub fn total_changes_count(&self) -> usize {
-        self.core.total_changes_count()
+        match self.core.planned_changes() {
+            Some(changes) => changes.len(),
+            None => 0,
+        }
     }
 
     // === Dependency caching (TUI optimization) ===
@@ -187,7 +190,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status_message = format!("Failed to build search index: {}", e);
+                self.status_message = format!("Failed to build search index: {e}");
                 return;
             }
         }
@@ -195,8 +198,9 @@ impl App {
     }
 
     pub fn execute_search(&mut self) {
-        if let Err(e) = self.core.set_search_query(&self.core.search.query.clone()) {
-            self.status_message = format!("Search error: {}", e);
+        let query = self.core.search_query().to_string();
+        if let Err(e) = self.core.set_search_query(&query) {
+            self.status_message = format!("Search error: {e}");
         }
         self.refresh_ui_state();
     }
@@ -222,7 +226,7 @@ impl App {
     // === Filter ===
 
     pub fn apply_current_filter(&mut self) {
-        self.core.apply_filter(self.core.selected_filter);
+        self.core.apply_filter(self.core.selected_filter());
         self.col_widths = self.core.rebuild_list();
         self.reset_selection();
     }
@@ -239,57 +243,111 @@ impl App {
     // === Package marking ===
 
     pub fn toggle_current(&mut self) {
-        if let Some(pkg) = self.selected_package() {
-            let name = pkg.name.clone();
-            match self.core.toggle_package(&name) {
-                ToggleResult::Unmarked => {
+        let Some(pkg) = self.selected_package() else {
+            return;
+        };
+        let id = pkg.id;
+        // Use display name (strips native arch suffix)
+        let pkg_name = self.core.cache().display_name(&pkg.name).to_string();
+        let was_marked = pkg.status.is_marked();
+
+        // Use the library's toggle() which handles cascade correctly
+        let result = self.core.toggle(id);
+
+        match result {
+            ToggleResult::Marked { package: _, additional } => {
+                // Package was marked - check if there are additional deps
+                if additional.is_empty() {
+                    // No additional deps, just update UI
                     self.refresh_ui_state();
                     self.update_status_message();
-                }
-                ToggleResult::NeedsPreview => {
-                    self.modals.mark_confirm_scroll = 0;
+                } else {
+                    // Build preview for confirmation modal
+                    let preview = self.core.build_mark_preview(id);
+                    self.mark_preview = preview;
+                    self.mark_preview_scroll = 0;
                     self.state = AppState::ShowingMarkConfirm;
                 }
-                ToggleResult::MarkedDirectly => {
+            }
+            ToggleResult::Unmarked { package: _, also_unmarked } => {
+                // Package was unmarked - check if cascade happened
+                if also_unmarked.is_empty() {
+                    // No cascade, just update UI
                     self.refresh_ui_state();
                     self.update_status_message();
-                }
-                ToggleResult::NotMarkable => {}
-                ToggleResult::Error(e) => {
-                    self.status_message = e;
+                } else {
+                    // Build preview showing what was unmarked (using display names)
+                    let cache = self.core.cache();
+                    let also_names: Vec<String> = also_unmarked.iter()
+                        .filter_map(|id| cache.fullname_of(*id).map(|n| cache.display_name(n).to_string()))
+                        .collect();
+
+                    let preview = MarkPreview {
+                        package_name: pkg_name,
+                        is_upgrade: was_marked,
+                        is_marking: false, // This is an unmark operation
+                        additional_installs: Vec::new(),
+                        additional_upgrades: also_names, // Reuse this field for "also unmarked"
+                        additional_removes: Vec::new(),
+                        download_size: 0,
+                    };
+                    self.mark_preview = Some(preview);
+                    self.mark_preview_scroll = 0;
+                    self.state = AppState::ShowingMarkConfirm;
                 }
             }
         }
     }
 
     pub fn confirm_mark(&mut self) {
-        if !self.modals.pending_visual_mark.is_empty() {
-            // Visual mode confirmation
-            let packages = std::mem::take(&mut self.modals.pending_visual_mark);
-            self.core.confirm_mark_packages(&packages);
-        } else if self.core.mark_preview.is_marking {
-            // Single package mark confirmation
-            self.core.confirm_mark();
-        } else {
-            // Single package unmark confirmation
-            self.core.confirm_unmark();
-        }
+        // Package is already marked and planned - just close the modal
+        self.mark_preview = None;
         self.refresh_ui_state();
         self.update_status_message();
         self.state = AppState::Listing;
     }
 
     pub fn cancel_mark(&mut self) {
-        self.modals.pending_visual_mark.clear();
-        self.core.cancel_mark();
+        if let Some(ref preview) = self.mark_preview {
+            if preview.is_marking {
+                // Undo a mark operation - unmark the package
+                if let Some(id) = self.core.list().iter()
+                    .find(|p| p.name == preview.package_name)
+                    .map(|p| p.id)
+                {
+                    self.core.unmark(id);
+                }
+            } else {
+                // Undo an unmark operation - re-mark the packages
+                // The original package name + additional_upgrades (repurposed as "also unmarked")
+                let names_to_remark: Vec<String> = std::iter::once(preview.package_name.clone())
+                    .chain(preview.additional_upgrades.iter().cloned())
+                    .collect();
+
+                for name in names_to_remark {
+                    if let Some(id) = self.core.list().iter()
+                        .find(|p| p.name == name)
+                        .map(|p| p.id)
+                    {
+                        self.core.mark_install(id);
+                    }
+                }
+                // Recompute plan after re-marking
+                self.core.compute_plan();
+            }
+        }
+        self.mark_preview = None;
+        self.refresh_ui_state();
         self.update_status_message();
         self.state = AppState::Listing;
     }
 
     pub fn mark_all_upgrades(&mut self) {
-        if let Err(e) = self.core.mark_all_upgrades() {
-            self.status_message = e;
-            return;
+        // Mark all upgradable packages
+        for pkg in self.core.list().to_vec() {
+            if pkg.status == PackageStatus::Upgradable {
+                self.core.mark_install(pkg.id);
+            }
         }
         self.refresh_ui_state();
         self.update_status_message();
@@ -297,7 +355,7 @@ impl App {
     }
 
     pub fn unmark_all(&mut self) {
-        self.core.unmark_all();
+        self.core.reset();
         self.refresh_ui_state();
         self.update_status_message();
     }
@@ -351,30 +409,24 @@ impl App {
     }
 
     fn mark_selected_packages(&mut self) {
-        let packages_to_mark: Vec<String> = self.ui.multi_select.iter()
+        // Get the PackageIds of selected packages
+        let ids_to_mark: Vec<PackageId> = self.ui.multi_select.iter()
             .filter_map(|&idx| self.core.get_package(idx))
-            .map(|p| p.name.clone())
+            .filter(|p| p.status == PackageStatus::Upgradable || p.status == PackageStatus::NotInstalled)
+            .map(|p| p.id)
             .collect();
 
         self.ui.multi_select.clear();
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
 
-        match self.core.preview_mark_packages(&packages_to_mark) {
-            PreviewResult::NeedsConfirmation => {
-                self.modals.pending_visual_mark = packages_to_mark;
-                self.modals.mark_confirm_scroll = 0;
-                self.state = AppState::ShowingMarkConfirm;
-            }
-            PreviewResult::NoAdditionalChanges => {
-                self.core.confirm_mark_packages(&packages_to_mark);
-                self.refresh_ui_state();
-                self.update_status_message();
-            }
-            PreviewResult::Error(e) => {
-                self.status_message = e;
-            }
+        // Mark all selected packages
+        for id in ids_to_mark {
+            self.core.mark_install(id);
         }
+
+        self.refresh_ui_state();
+        self.update_status_message();
     }
 
     // === Navigation ===
@@ -436,7 +488,7 @@ impl App {
         };
 
         self.modals.changelog_content.clear();
-        self.modals.changelog_content.push(format!("Loading changelog for {}...", pkg_name));
+        self.modals.changelog_content.push(format!("Loading changelog for {pkg_name}..."));
         self.modals.changelog_scroll = 0;
 
         match self.core.fetch_changelog(&pkg_name) {
@@ -487,6 +539,8 @@ impl App {
 
     pub fn show_changes_preview(&mut self) {
         if self.has_pending_changes() {
+            // Compute plan to get full changeset
+            self.core.compute_plan();
             self.state = AppState::ShowingChanges;
             self.modals.changes_scroll = 0;
         } else {
@@ -509,46 +563,54 @@ impl App {
     }
 
     pub fn scroll_mark_confirm(&mut self, delta: i32) {
-        let max_scroll = self.mark_confirm_line_count().saturating_sub(5) as u16;
-        let current = self.modals.mark_confirm_scroll as i32;
-        self.modals.mark_confirm_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let max_scroll = self.mark_confirm_line_count().saturating_sub(10);
+        let current = self.mark_preview_scroll as i32;
+        self.mark_preview_scroll = (current + delta).clamp(0, max_scroll as i32) as usize;
     }
 
     pub fn changes_line_count(&self) -> usize {
-        let pending = &self.core.pending;
-        let mut count = 2;
-        if !pending.to_upgrade.is_empty() { count += 2 + pending.to_upgrade.len(); }
-        if !pending.to_install.is_empty() { count += 2 + pending.to_install.len(); }
-        if !pending.auto_upgrade.is_empty() { count += 2 + pending.auto_upgrade.len(); }
-        if !pending.auto_install.is_empty() { count += 2 + pending.auto_install.len(); }
-        if !pending.to_remove.is_empty() { count += 2 + pending.to_remove.len(); }
-        if !pending.auto_remove.is_empty() { count += 2 + pending.auto_remove.len(); }
-        count + 4
+        match self.core.planned_changes() {
+            Some(changes) => changes.len() + 10,
+            None => 5,
+        }
     }
 
     pub fn mark_confirm_line_count(&self) -> usize {
-        let preview = &self.core.mark_preview;
-        let mut count = 4;
-        count += preview.additional_upgrades.len();
-        count += preview.additional_installs.len();
-        count += preview.additional_removes.len();
-        count + 4
+        if let Some(ref preview) = self.mark_preview {
+            let mut count = 2; // Header lines
+            if !preview.additional_installs.is_empty() {
+                count += 1 + preview.additional_installs.len();
+            }
+            if !preview.additional_upgrades.is_empty() {
+                count += 1 + preview.additional_upgrades.len();
+            }
+            if !preview.additional_removes.is_empty() {
+                count += 1 + preview.additional_removes.len();
+            }
+            count + 2 // Footer lines
+        } else {
+            0
+        }
     }
 
     // === Status message ===
 
     pub fn update_status_message(&mut self) {
-        let changes = self.total_changes_count();
+        let has_marks = self.core.has_marks();
 
-        if changes > 0 {
+        if has_marks {
+            // Count user marks
+            let mark_count = self.core.list().iter()
+                .filter(|p| self.core.is_user_marked(p.id))
+                .count();
+
             self.status_message = format!(
-                "{} changes pending ({} download) | {} upgradable | Press 'u' to review",
-                changes,
-                PackageInfo::size_str(self.core.pending.download_size),
-                self.core.upgradable_count
+                "{} packages marked | {} upgradable | Press 'u' to review",
+                mark_count,
+                self.core.upgradable_count()
             );
         } else {
-            self.status_message = format!("{} packages upgradable", self.core.upgradable_count);
+            self.status_message = format!("{} packages upgradable", self.core.upgradable_count());
         }
     }
 
@@ -556,7 +618,7 @@ impl App {
 
     #[must_use]
     pub fn is_root() -> bool {
-        PackageManager::is_root()
+        is_root()
     }
 
     pub fn apply_changes(&mut self) -> ApplyResult {
@@ -582,10 +644,10 @@ impl App {
             }
             Err(e) => {
                 println!("\n=== Error applying changes ===");
-                println!("{}", e);
-                self.output_lines.push(format!("Error: {}", e));
+                println!("{e}");
+                self.output_lines.push(format!("Error: {e}"));
                 self.state = AppState::Done;
-                self.status_message = format!("Error: {}. Press 'q' to quit or 'r' to refresh.", e);
+                self.status_message = format!("Error: {e}. Press 'q' to quit or 'r' to refresh.");
             }
         }
 
@@ -598,25 +660,32 @@ impl App {
 
         println!("\n=== Applying changes with sudo ===\n");
 
+        // Compute plan if not already done
+        self.core.compute_plan();
+
         let mut args = vec!["apt-get".to_string(), "-y".to_string()];
 
-        let pending = &self.core.pending;
-        let to_install: Vec<&str> = pending.to_install.iter()
-            .chain(pending.to_upgrade.iter())
-            .chain(pending.auto_install.iter())
-            .chain(pending.auto_upgrade.iter())
-            .map(|s| s.as_str())
-            .collect();
-
-        let to_remove: Vec<String> = pending.to_remove.iter()
-            .chain(pending.auto_remove.iter())
-            .map(|s| format!("{}-", s))
-            .collect();
+        // Get planned changes - derive names from PackageId
+        let (to_install, to_remove): (Vec<String>, Vec<String>) = match self.core.planned_changes() {
+            Some(changes) => {
+                let cache = self.core.cache();
+                let install: Vec<String> = changes.iter()
+                    .filter(|c| c.action == ChangeAction::Install || c.action == ChangeAction::Upgrade)
+                    .filter_map(|c| cache.fullname_of(c.package).map(String::from))
+                    .collect();
+                let remove: Vec<String> = changes.iter()
+                    .filter(|c| c.action == ChangeAction::Remove)
+                    .filter_map(|c| cache.fullname_of(c.package).map(|n| format!("{n}-")))
+                    .collect();
+                (install, remove)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
 
         if !to_install.is_empty() || !to_remove.is_empty() {
             args.push("install".to_string());
             for pkg in &to_install {
-                args.push(pkg.to_string());
+                args.push(pkg.clone());
             }
             for pkg in &to_remove {
                 args.push(pkg.clone());
@@ -638,7 +707,8 @@ impl App {
 
         let mut stderr_output = String::new();
         if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut stderr_output);
+            // Intentionally ignore read errors - stderr capture is best-effort
+            drop(stderr.read_to_string(&mut stderr_output));
         }
 
         let status = child.wait()?;
@@ -648,6 +718,8 @@ impl App {
             self.output_lines.push("Changes applied successfully.".to_string());
             self.state = AppState::Done;
             self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
+            // Reset to clean state
+            self.core.reset();
         } else {
             println!("\n=== Error applying changes ===");
             if !stderr_output.is_empty() {
@@ -657,7 +729,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !filtered_err.is_empty() {
-                    println!("{}", filtered_err);
+                    println!("{filtered_err}");
                     self.output_lines.push(format!("Error: {}", filtered_err.lines().next().unwrap_or("apt-get failed")));
                 } else {
                     self.output_lines.push("Error: apt-get failed (wrong password?)".to_string());
@@ -669,19 +741,17 @@ impl App {
             self.status_message = "Error: apt-get failed. Press 'q' to quit or 'r' to refresh.".to_string();
         }
 
-        self.core.apt.clear_user_marks();
-
         Ok(())
     }
 
     pub fn refresh_cache(&mut self) -> Result<()> {
-        if let Some(msg) = PackageManager::check_apt_lock() {
+        if let Some(msg) = check_apt_lock() {
             self.status_message = msg;
             return Ok(());
         }
 
         if let Err(e) = self.core.refresh() {
-            self.status_message = format!("Refresh failed: {}", e);
+            self.status_message = format!("Refresh failed: {e}");
             return Ok(());
         }
 

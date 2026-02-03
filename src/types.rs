@@ -2,30 +2,124 @@
 
 use ratatui::prelude::*;
 
-/// Package status matching Synaptic's status icons
+// ============================================================================
+// Core API Types (Typestate Pattern)
+// ============================================================================
+
+/// Opaque handle to a package. Valid only for the current cache generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PackageId(pub(crate) u32);
+
+impl PackageId {
+    /// Get the raw index (for internal use)
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// What the user explicitly wants for a package
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UserIntent {
+    /// No user action - follow default behavior
+    #[default]
+    Default,
+    /// User explicitly wants this installed/upgraded
+    Install,
+    /// User explicitly wants this removed
+    Remove,
+    /// User explicitly wants to keep current version (prevent auto-changes)
+    Hold,
+}
+
+/// Why a package is changing
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChangeReason {
+    /// User explicitly requested this
+    UserRequested,
+    /// Required as a dependency of a user request
+    Dependency,
+    /// Will be auto-removed (orphan dependency)
+    AutoRemove,
+}
+
+/// Type of change to a package
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChangeAction {
+    Install,
+    Upgrade,
+    Remove,
+    Downgrade,
+}
+
+/// A computed change from the plan
+/// A planned change to a package. Name is derived from PackageId, not stored.
+#[derive(Clone, Debug)]
+pub struct PlannedChange {
+    pub package: PackageId,
+    pub action: ChangeAction,
+    pub reason: ChangeReason,
+    pub download_size: u64,
+    pub size_change: i64,
+}
+
+// ============================================================================
+// Typestate Markers
+// ============================================================================
+
+/// Clean state - no pending changes
+pub struct Clean;
+
+/// Dirty state - has user marks but no computed plan
+pub struct Dirty;
+
+/// Planned state - dependencies resolved, changeset computed
+pub struct Planned {
+    pub changes: Vec<PlannedChange>,
+    pub download_size: u64,
+    pub install_size_change: i64,
+    pub errors: Vec<String>,
+}
+
+/// Marker trait for states where the cache is readable
+pub trait ReadableState {}
+impl ReadableState for Clean {}
+impl ReadableState for Dirty {}
+impl ReadableState for Planned {}
+
+/// Marker trait for states where user can modify marks
+pub trait MarkableState {}
+impl MarkableState for Clean {}
+impl MarkableState for Dirty {}
+
+// ============================================================================
+// Legacy Types (for UI compatibility during migration)
+// ============================================================================
+
+/// Package status - no distinction between user-marked and dependency
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageStatus {
-    Upgradable,      // ↑ Package can be upgraded (yellow)
-    MarkedForUpgrade, // ↑ Package marked for upgrade (green)
-    Install,         // + Package marked for install
-    Remove,          // - Package marked for removal
-    Keep,            // = Package kept at current version
-    Installed,       // · Package is installed (no changes)
-    NotInstalled,    //   Package is not installed
-    Broken,          // ✗ Package is broken
-    AutoInstall,     // + Automatically installed (dependency)
-    AutoRemove,      // - Automatically removed
+    // Base states (not marked)
+    Installed,        // · Package is installed, no changes pending
+    NotInstalled,     //   Package is not installed, no changes pending
+    Upgradable,       // ↑ Package can be upgraded (yellow)
+    // Marked states (all marked packages look identical)
+    MarkedForInstall, // + Package will be installed
+    MarkedForUpgrade, // ↑ Package will be upgraded (green)
+    MarkedForRemove,  // - Package will be removed
+    // Other
+    Keep,             // = Package kept at current version
+    Broken,           // ✗ Package is broken
 }
 
 impl PackageStatus {
     pub fn symbol(&self) -> &'static str {
         match self {
             Self::Upgradable | Self::MarkedForUpgrade => "↑",
-            Self::Install | Self::AutoInstall => "+",
-            Self::Remove | Self::AutoRemove => "-",
+            Self::MarkedForInstall => "+",
+            Self::MarkedForRemove => "-",
             Self::Keep => "=",
             Self::Installed => "·",
-            Self::NotInstalled => "",
+            Self::NotInstalled => " ",
             Self::Broken => "✗",
         }
     }
@@ -34,13 +128,22 @@ impl PackageStatus {
         match self {
             Self::Upgradable => Color::Yellow,
             Self::MarkedForUpgrade => Color::Green,
-            Self::Install | Self::AutoInstall => Color::Green,
-            Self::Remove | Self::AutoRemove => Color::Red,
+            Self::MarkedForInstall => Color::Green,
+            Self::MarkedForRemove => Color::Red,
             Self::Keep => Color::Blue,
             Self::Installed => Color::DarkGray,
             Self::NotInstalled => Color::Gray,
             Self::Broken => Color::LightRed,
         }
+    }
+
+    /// Check if this status represents a marked (pending change) state
+    pub fn is_marked(&self) -> bool {
+        matches!(self,
+            Self::MarkedForInstall |
+            Self::MarkedForUpgrade |
+            Self::MarkedForRemove
+        )
     }
 }
 
@@ -76,11 +179,12 @@ impl FilterCategory {
     }
 }
 
-/// Displayed package info (extracted from rust-apt Package)
+/// Displayed package info (extracted from rust-apt Package).
+/// The package is identified by `id` (PackageId). Name is derived, not stored separately.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub name: String,         // Base name for APT operations (e.g., "libfoo")
-    pub display_name: String, // Display name, may include :arch suffix (e.g., "libfoo:i386")
+    pub id: PackageId,        // Stable handle for this package - the ONLY identifier
+    pub name: String,         // Full name including arch (e.g., "libfoo:i386") - for display/sort
     pub status: PackageStatus,
     pub section: String,
     pub installed_version: String,
@@ -89,7 +193,6 @@ pub struct PackageInfo {
     pub download_size: u64,
     pub description: String,
     pub architecture: String,
-    pub is_user_marked: bool,
 }
 
 impl PackageInfo {
@@ -108,7 +211,7 @@ impl PackageInfo {
         } else if bytes >= KB {
             format!("{:.1} KB", bytes as f64 / KB as f64)
         } else {
-            format!("{} B", bytes)
+            format!("{bytes} B")
         }
     }
 
@@ -210,10 +313,26 @@ pub enum ApplyResult {
     NeedsCommit,
 }
 
+/// Result of toggling a package
+#[derive(Debug)]
+pub enum ToggleResult {
+    /// Package was marked, with optional additional deps
+    Marked {
+        package: PackageId,
+        additional: Vec<PackageId>,
+    },
+    /// Package was unmarked, with cascade
+    Unmarked {
+        package: PackageId,
+        also_unmarked: Vec<PackageId>,
+    },
+}
+
 /// Additional changes required when marking a single package
 #[derive(Debug, Default, Clone)]
 pub struct MarkPreview {
     pub package_name: String,
+    pub is_upgrade: bool, // true = package is being upgraded, false = new install
     pub is_marking: bool, // true = marking for install, false = unmarking
     pub additional_installs: Vec<String>,
     pub additional_upgrades: Vec<String>,

@@ -1,4 +1,7 @@
 //! APT cache operations and package management
+//!
+//! This module provides a thin wrapper around rust-apt with PackageId handles.
+//! User intent tracking is handled by the core module, not here.
 
 use std::collections::HashMap;
 
@@ -10,26 +13,102 @@ use rust_apt::{Package, Version};
 
 use crate::types::*;
 
-/// Manages APT cache interactions and user-marked packages
-pub struct AptManager {
+/// Manages APT cache interactions with stable PackageId handles.
+/// Each unique package (including multi-arch variants) gets its own PackageId.
+pub struct AptCache {
     cache: Cache,
-    user_marked: HashMap<String, bool>,
+    /// Map from package full name (e.g., "libfoo:amd64") to stable PackageId
+    pub fullname_to_id: HashMap<String, PackageId>,
+    /// Reverse map: PackageId -> full name
+    id_to_fullname: Vec<String>,
+    /// Native architecture (e.g., "amd64")
+    native_arch: String,
 }
 
-impl AptManager {
-    /// Create a new AptManager with a fresh APT cache
+impl AptCache {
+    /// Create a new AptCache with a fresh APT cache, pre-populating all PackageIds.
+    /// Each multi-arch variant gets its own unique PackageId.
     pub fn new() -> Result<Self> {
         let cache = Cache::new::<&str>(&[])?;
+
+        // Get native architecture from dpkg
+        let native_arch = std::process::Command::new("dpkg")
+            .arg("--print-architecture")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "amd64".to_string());
+        let mut fullname_to_id = HashMap::new();
+        let mut id_to_fullname = Vec::new();
+
+        // Pre-populate all package IDs at creation time using FULL names
+        // This properly handles multi-arch: libfoo:amd64 and libfoo:i386 get different IDs
+        for pkg in cache.packages(&PackageSort::default()) {
+            let fullname = pkg.fullname(false);
+            let id = PackageId(id_to_fullname.len() as u32);
+            id_to_fullname.push(fullname.clone());
+            fullname_to_id.insert(fullname, id);
+        }
+
         Ok(Self {
             cache,
-            user_marked: HashMap::new(),
+            fullname_to_id,
+            id_to_fullname,
+            native_arch,
         })
     }
 
-    /// Get a package by name
-    pub fn get(&self, name: &str) -> Option<Package<'_>> {
-        self.cache.get(name)
+    /// Get the native architecture (e.g., "amd64")
+    pub fn native_arch(&self) -> &str {
+        &self.native_arch
     }
+
+    /// Get display name for a package (strips native arch suffix)
+    /// "libfoo:amd64" -> "libfoo" (if amd64 is native)
+    /// "libfoo:i386" -> "libfoo:i386" (keeps non-native arch)
+    pub fn display_name<'a>(&self, fullname: &'a str) -> &'a str {
+        let suffix = format!(":{}", self.native_arch);
+        fullname.strip_suffix(&suffix).unwrap_or(fullname)
+    }
+
+    // ========================================================================
+    // PackageId management
+    // ========================================================================
+
+    /// Get or create a stable PackageId for a package full name (e.g., "libfoo:amd64")
+    pub fn id_for(&mut self, fullname: &str) -> PackageId {
+        if let Some(&id) = self.fullname_to_id.get(fullname) {
+            id
+        } else {
+            let id = PackageId(self.id_to_fullname.len() as u32);
+            self.id_to_fullname.push(fullname.to_string());
+            self.fullname_to_id.insert(fullname.to_string(), id);
+            id
+        }
+    }
+
+    /// Get the PackageId for a full name (returns None if not known)
+    pub fn get_id(&self, fullname: &str) -> Option<PackageId> {
+        self.fullname_to_id.get(fullname).copied()
+    }
+
+    /// Get the full name for a PackageId
+    pub fn fullname_of(&self, id: PackageId) -> Option<&str> {
+        self.id_to_fullname.get(id.index()).map(std::string::String::as_str)
+    }
+
+    /// Get a package by PackageId
+    pub fn get_by_id(&self, id: PackageId) -> Option<Package<'_>> {
+        self.fullname_of(id).and_then(|fullname| self.cache.get(fullname))
+    }
+
+    /// Get a package by full name (e.g., "libfoo:amd64" or just "libfoo")
+    pub fn get(&self, fullname: &str) -> Option<Package<'_>> {
+        self.cache.get(fullname)
+    }
+
+    // ========================================================================
+    // Package iteration
+    // ========================================================================
 
     /// Get an iterator over packages with the given sort
     pub fn packages(&self, sort: &PackageSort) -> impl Iterator<Item = Package<'_>> {
@@ -41,92 +120,107 @@ impl AptManager {
         self.cache.get_changes(false)
     }
 
+    // ========================================================================
+    // Marking operations (low-level, crate-only)
+    // These are only accessible from core.rs via SharedState.
+    // External code must use ManagerState methods which enforce the typestate.
+    // ========================================================================
+
+    /// Mark a package for install/upgrade (by name)
+    pub(crate) fn mark_install(&self, name: &str) {
+        if let Some(pkg) = self.cache.get(name) {
+            pkg.mark_install(true, true);
+            // Note: We don't call protect() because we manage state through
+            // user_intent in core.rs, not through APT's protection mechanism.
+            // This allows clear_all_marks() to properly reset the cache.
+        }
+    }
+
+    /// Mark a package for install/upgrade (by id)
+    pub(crate) fn mark_install_id(&self, id: PackageId) {
+        if let Some(name) = self.fullname_of(id) {
+            self.mark_install(name);
+        }
+    }
+
+    /// Mark a package for removal (by name)
+    pub(crate) fn mark_delete(&self, name: &str) {
+        if let Some(pkg) = self.cache.get(name) {
+            pkg.mark_delete(false);
+            // Note: No protect() - we manage state through user_intent
+        }
+    }
+
+    /// Mark a package for removal (by id)
+    pub(crate) fn mark_delete_id(&self, id: PackageId) {
+        if let Some(name) = self.fullname_of(id) {
+            self.mark_delete(name);
+        }
+    }
+
+    /// Mark a package to keep current version (unmark)
+    pub(crate) fn mark_keep(&self, name: &str) {
+        if let Some(pkg) = self.cache.get(name) {
+            pkg.mark_keep();
+        }
+    }
+
+    /// Mark a package to keep (by id)
+    pub(crate) fn mark_keep_id(&self, id: PackageId) {
+        if let Some(name) = self.fullname_of(id) {
+            self.mark_keep(name);
+        }
+    }
+
+    /// Clear all marks on all packages
+    pub(crate) fn clear_all_marks(&self) {
+        // Collect fullnames first to avoid iterator invalidation issues
+        let to_clear: Vec<_> = self.cache.get_changes(false)
+            .map(|pkg| pkg.fullname(false))
+            .collect();
+
+        for fullname in &to_clear {
+            if let Some(pkg) = self.cache.get(fullname) {
+                pkg.mark_keep();
+            }
+        }
+    }
+
     /// Resolve dependencies
-    pub fn resolve(&mut self) -> Result<(), AptErrors> {
+    pub(crate) fn resolve(&mut self) -> Result<(), AptErrors> {
         self.cache.resolve(true)
     }
 
-    // === Marking operations ===
+    // ========================================================================
+    // Package info extraction (status determined by APT state only)
+    // ========================================================================
 
-    /// Mark a package for install/upgrade and record as user-marked
-    pub fn mark_install(&mut self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
-            pkg.mark_install(true, true);
-            pkg.protect();
-            self.user_marked.insert(name.to_string(), true);
+    /// Get basic status for a package (without user intent - that's in core)
+    pub fn get_apt_status(&self, pkg: &Package) -> AptPackageState {
+        AptPackageState {
+            is_installed: pkg.is_installed(),
+            is_upgradable: pkg.is_upgradable(),
+            marked_install: pkg.marked_install(),
+            marked_delete: pkg.marked_delete(),
+            marked_upgrade: pkg.marked_upgrade(),
         }
     }
 
-    /// Mark a package to keep current version
-    pub fn mark_keep(&mut self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
-            pkg.mark_keep();
-            self.user_marked.remove(name);
-        }
+    /// Extract package info by name
+    pub fn extract_package_info_by_name(&self, name: &str) -> Option<PackageInfo> {
+        let pkg = self.cache.get(name)?;
+        self.extract_package_info(&pkg)
     }
 
-    /// Clear all user marks
-    pub fn clear_user_marks(&mut self) {
-        self.user_marked.clear();
-    }
-
-    // === Package info extraction ===
-
-    /// Get status for a package by name
-    pub fn get_package_status(&self, name: &str) -> PackageStatus {
-        match self.cache.get(name) {
-            Some(pkg) => {
-                if pkg.marked_upgrade() {
-                    PackageStatus::MarkedForUpgrade
-                } else if pkg.marked_install() {
-                    if pkg.is_installed() {
-                        PackageStatus::MarkedForUpgrade
-                    } else if self.user_marked.get(name).copied().unwrap_or(false) {
-                        PackageStatus::Install
-                    } else {
-                        PackageStatus::AutoInstall
-                    }
-                } else if pkg.marked_delete() {
-                    if self.user_marked.get(name).copied().unwrap_or(false) {
-                        PackageStatus::Remove
-                    } else {
-                        PackageStatus::AutoRemove
-                    }
-                } else if pkg.is_installed() {
-                    if pkg.is_upgradable() {
-                        PackageStatus::Upgradable
-                    } else {
-                        PackageStatus::Installed
-                    }
-                } else {
-                    PackageStatus::NotInstalled
-                }
-            }
-            None => PackageStatus::NotInstalled,
-        }
-    }
-
-    /// Extract full package info from an APT Package
+    /// Extract package info from an APT Package.
+    /// Returns BASE status (installed/upgradable/not-installed) - ignores APT marks.
+    /// The core module will compute final display status based on user_intent.
     pub fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
         let candidate = pkg.candidate()?;
 
-        let status = if pkg.marked_upgrade() {
-            PackageStatus::MarkedForUpgrade
-        } else if pkg.marked_install() {
-            if pkg.is_installed() {
-                PackageStatus::MarkedForUpgrade
-            } else if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
-                PackageStatus::Install
-            } else {
-                PackageStatus::AutoInstall
-            }
-        } else if pkg.marked_delete() {
-            if self.user_marked.get(pkg.name()).copied().unwrap_or(false) {
-                PackageStatus::Remove
-            } else {
-                PackageStatus::AutoRemove
-            }
-        } else if pkg.is_installed() {
+        // Return BASE status only - ignore APT marks
+        // core.rs will overlay user_intent and dependency info for display
+        let status = if pkg.is_installed() {
             if pkg.is_upgradable() {
                 PackageStatus::Upgradable
             } else {
@@ -141,30 +235,27 @@ impl AptManager {
             .map(|v: Version| v.version().to_string())
             .unwrap_or_default();
 
-        let installed_size = candidate.installed_size();
-        let download_size = candidate.size();
+        let fullname = pkg.fullname(false);
+        // Use get_id with FULL name since IDs are mapped to full names
+        let id = self.get_id(&fullname).unwrap_or(PackageId(u32::MAX));
 
-        let description = candidate.summary().unwrap_or_default().to_string();
-        let section = candidate.section().unwrap_or("unknown").to_string();
-        let architecture = candidate.arch().to_string();
-
-        let name = pkg.name().to_string();
         Some(PackageInfo {
-            display_name: name.clone(), // Will be updated in rebuild_list if needed
-            name,
+            id,
+            name: fullname,
             status,
-            section,
+            section: candidate.section().unwrap_or("unknown").to_string(),
             installed_version,
             candidate_version: candidate.version().to_string(),
-            installed_size,
-            download_size,
-            description,
-            architecture,
-            is_user_marked: self.user_marked.get(pkg.name()).copied().unwrap_or(false),
+            installed_size: candidate.installed_size(),
+            download_size: candidate.size(),
+            description: candidate.summary().unwrap_or_default().clone(),
+            architecture: candidate.arch().to_string(),
         })
     }
 
-    // === Dependency queries ===
+    // ========================================================================
+    // Dependency queries
+    // ========================================================================
 
     /// Get forward dependencies for a package
     pub fn get_dependencies(&self, name: &str) -> Vec<(String, String)> {
@@ -175,8 +266,8 @@ impl AptManager {
             None => return deps,
         };
 
-        if let Some(version) = pkg.candidate() {
-            if let Some(dependencies) = version.dependencies() {
+        if let Some(version) = pkg.candidate()
+            && let Some(dependencies) = version.dependencies() {
                 for dep in dependencies {
                     let dep_type = dep.dep_type().to_string();
                     for base_dep in dep.iter() {
@@ -184,9 +275,7 @@ impl AptManager {
                     }
                 }
             }
-        }
 
-        // Sort by type priority, then by name
         deps.sort_by(|a, b| {
             dep_type_order(&a.0)
                 .cmp(&dep_type_order(&b.0))
@@ -206,8 +295,8 @@ impl AptManager {
         };
 
         let rdep_map = pkg.rdepends();
-        for (dep_type, deps) in rdep_map.iter() {
-            let type_str = format!("{:?}", dep_type);
+        for (dep_type, deps) in rdep_map {
+            let type_str = format!("{dep_type:?}");
             for dep in deps {
                 for base_dep in dep.iter() {
                     rdeps.push((type_str.clone(), base_dep.name().to_string()));
@@ -215,7 +304,6 @@ impl AptManager {
             }
         }
 
-        // Sort by type priority, then by name
         rdeps.sort_by(|a, b| {
             dep_type_order(&a.0)
                 .cmp(&dep_type_order(&b.0))
@@ -225,114 +313,49 @@ impl AptManager {
         rdeps
     }
 
-    // === Change calculation ===
-
-    /// Calculate pending changes from the cache state
-    pub fn calculate_pending(&self) -> PendingChanges {
-        let mut pending = PendingChanges::default();
-
-        for pkg in self.cache.get_changes(false) {
-            let name = pkg.name().to_string();
-            let is_user = self.user_marked.get(&name).copied().unwrap_or(false);
-
-            if pkg.marked_install() {
-                if pkg.is_installed() {
-                    if is_user {
-                        pending.to_upgrade.push(name);
-                    } else {
-                        pending.auto_upgrade.push(name);
-                    }
-                } else if is_user {
-                    pending.to_install.push(name);
-                } else {
-                    pending.auto_install.push(name);
-                }
-
-                if let Some(cand) = pkg.candidate() {
-                    pending.download_size += cand.size();
-                    pending.install_size_change += cand.installed_size() as i64;
-                }
-            } else if pkg.marked_delete() {
-                if is_user {
-                    pending.to_remove.push(name);
-                } else {
-                    pending.auto_remove.push(name);
-                }
-
-                if let Some(inst) = pkg.installed() {
-                    pending.install_size_change -= inst.installed_size() as i64;
-                }
-            }
-        }
-
-        pending
-    }
+    // ========================================================================
+    // Statistics
+    // ========================================================================
 
     /// Count upgradable packages
     pub fn count_upgradable(&self) -> usize {
         self.cache
             .packages(&PackageSort::default())
-            .filter(|p| p.is_upgradable())
+            .filter(rust_apt::Package::is_upgradable)
             .count()
     }
 
-    // === Cache refresh and restore ===
+    // ========================================================================
+    // Cache lifecycle
+    // ========================================================================
 
-    /// Restore cache to user-marked state without reloading
-    /// This is faster than refresh() for undoing temporary marks (e.g., preview)
-    pub fn restore_to_user_marks(&mut self) {
-        // Get all currently changed packages
-        let changed: Vec<String> = self.cache
-            .get_changes(false)
-            .map(|p| p.name().to_string())
-            .collect();
-
-        // Clear all marks
-        for name in &changed {
-            if let Some(pkg) = self.cache.get(name) {
-                pkg.mark_keep();
-            }
-        }
-
-        // Re-apply user marks
-        for name in self.user_marked.keys() {
-            if let Some(pkg) = self.cache.get(name) {
-                pkg.mark_install(true, true);
-                pkg.protect();
-            }
-        }
-
-        // Resolve dependencies
-        if !self.user_marked.is_empty() {
-            let _ = self.cache.resolve(true);
-        }
-    }
-
-    /// Full refresh clearing all marks
-    pub fn full_refresh(&mut self) -> Result<()> {
+    /// Full refresh - reload cache from disk
+    pub fn refresh(&mut self) -> Result<()> {
         self.cache = Cache::new::<&str>(&[])?;
-        self.user_marked.clear();
+        // Note: We keep the id mappings - they're still valid names
         Ok(())
     }
 
-    // === System operations ===
-
     /// Commit changes using native APT progress
-    /// Note: This replaces the internal cache
-    pub fn commit(&mut self) -> Result<()> {
+    pub(crate) fn commit(&mut self) -> Result<()> {
         let mut acquire_progress = AcquireProgress::apt();
         let mut install_progress = InstallProgress::apt();
 
-        // Take ownership of cache for commit
         let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
-
         cache.commit(&mut acquire_progress, &mut install_progress)?;
-
-        // Clear state after successful commit
-        self.user_marked.clear();
 
         Ok(())
     }
+}
+
+/// Raw APT state for a package (no interpretation)
+#[derive(Debug, Clone, Copy)]
+pub struct AptPackageState {
+    pub is_installed: bool,
+    pub is_upgradable: bool,
+    pub marked_install: bool,
+    pub marked_delete: bool,
+    pub marked_upgrade: bool,
 }
 
 /// Helper function to order dependency types by priority
@@ -353,7 +376,6 @@ pub fn format_apt_errors(errors: &AptErrors) -> String {
 
     for error in errors.iter() {
         let msg = error.to_string();
-        // Skip empty or generic messages
         if !msg.is_empty() && msg != "E:" {
             messages.push(msg);
         }
@@ -364,7 +386,6 @@ pub fn format_apt_errors(errors: &AptErrors) -> String {
     } else if messages.len() == 1 {
         messages[0].clone()
     } else {
-        // Join multiple errors
         format!("{}; and {} more issue(s)", messages[0], messages.len() - 1)
     }
 }
