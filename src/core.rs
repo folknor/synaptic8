@@ -104,7 +104,6 @@ impl PackageManager {
     /// Rebuild the package list based on current filter and search
     pub fn rebuild_list(&mut self) -> ColumnWidths {
         self.list.clear();
-        let mut col_widths = ColumnWidths::new();
 
         let sort = if self.selected_filter == FilterCategory::Upgradable {
             PackageSort::default().upgradable()
@@ -112,6 +111,7 @@ impl PackageManager {
             PackageSort::default()
         };
 
+        // First pass: collect all matching packages
         for pkg in self.apt.packages(&sort) {
             // Apply category filter
             let matches_category = match self.selected_filter {
@@ -132,14 +132,29 @@ impl PackageManager {
 
             if matches_category && matches_search {
                 if let Some(info) = self.apt.extract_package_info(&pkg) {
-                    // Track max column widths
-                    col_widths.name = col_widths.name.max(info.name.len() as u16);
-                    col_widths.section = col_widths.section.max(info.section.len() as u16);
-                    col_widths.installed = col_widths.installed.max(info.installed_version.len() as u16);
-                    col_widths.candidate = col_widths.candidate.max(info.candidate_version.len() as u16);
                     self.list.push(info);
                 }
             }
+        }
+
+        // Second pass: find duplicate names and append :arch
+        let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for pkg in &self.list {
+            *name_counts.entry(pkg.name.clone()).or_insert(0) += 1;
+        }
+        for pkg in &mut self.list {
+            if name_counts.get(&pkg.name).copied().unwrap_or(0) > 1 {
+                pkg.name = format!("{}:{}", pkg.name, pkg.architecture);
+            }
+        }
+
+        // Calculate column widths
+        let mut col_widths = ColumnWidths::new();
+        for pkg in &self.list {
+            col_widths.name = col_widths.name.max(pkg.name.len() as u16);
+            col_widths.section = col_widths.section.max(pkg.section.len() as u16);
+            col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
+            col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
         }
 
         // Sort packages
