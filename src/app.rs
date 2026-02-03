@@ -267,9 +267,12 @@ impl App {
             // Visual mode confirmation
             let packages = std::mem::take(&mut self.modals.pending_visual_mark);
             self.core.confirm_mark_packages(&packages);
-        } else {
-            // Single package confirmation
+        } else if self.core.mark_preview.is_marking {
+            // Single package mark confirmation
             self.core.confirm_mark();
+        } else {
+            // Single package unmark confirmation
+            self.core.confirm_unmark();
         }
         self.refresh_ui_state();
         self.update_status_message();

@@ -252,13 +252,15 @@ impl PackageManager {
         drop(pkg);
 
         if currently_marked {
-            // Unmarking
-            self.apt.mark_keep(name);
-            if let Err(e) = self.apt.resolve() {
-                return ToggleResult::Error(format!("Dependency conflict: {}", format_apt_errors(&e)));
+            // Unmarking - preview what else will be affected
+            match self.preview_unmark(name) {
+                PreviewResult::NeedsConfirmation => ToggleResult::NeedsPreview,
+                PreviewResult::NoAdditionalChanges => {
+                    self.confirm_unmark();
+                    ToggleResult::Unmarked
+                }
+                PreviewResult::Error(e) => ToggleResult::Error(e),
             }
-            self.pending = self.apt.calculate_pending();
-            ToggleResult::Unmarked
         } else if is_upgradable || !is_installed {
             // Need to preview
             match self.preview_mark(name) {
@@ -357,6 +359,71 @@ impl PackageManager {
 
     /// Cancel the pending mark operation
     pub fn cancel_mark(&mut self) {
+        self.mark_preview = MarkPreview::default();
+        self.pending = self.apt.calculate_pending();
+    }
+
+    /// Preview what would be affected by unmarking a package
+    pub fn preview_unmark(&mut self, name: &str) -> PreviewResult {
+        // Get current marked packages before unmarking
+        let before: HashSet<String> = self.apt
+            .get_changes()
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Temporarily unmark to see what else gets affected
+        self.apt.mark_keep(name);
+        if let Err(e) = self.apt.resolve() {
+            self.restore_marks();
+            return PreviewResult::Error(format!("Dependency conflict: {}", format_apt_errors(&e)));
+        }
+
+        // Get remaining marked packages after unmarking
+        let after: HashSet<String> = self.apt
+            .get_changes()
+            .map(|p| p.name().to_string())
+            .collect();
+
+        // Find packages that were unmarked as a consequence (were in before, not in after)
+        let mut dropped_upgrades = Vec::new();
+        let mut dropped_installs = Vec::new();
+        for pkg_name in &before {
+            if pkg_name != name && !after.contains(pkg_name) {
+                if let Some(pkg) = self.apt.get(pkg_name) {
+                    if pkg.is_installed() {
+                        dropped_upgrades.push(pkg_name.clone());
+                    } else {
+                        dropped_installs.push(pkg_name.clone());
+                    }
+                }
+            }
+        }
+
+        // Restore state
+        self.restore_marks();
+
+        // Store in preview - reuse fields (additional_removes for dropped upgrades, etc.)
+        self.mark_preview = MarkPreview {
+            package_name: name.to_string(),
+            is_marking: false,
+            additional_installs: dropped_installs,  // Will also be dropped
+            additional_upgrades: dropped_upgrades,  // Will also be dropped
+            additional_removes: Vec::new(),
+            download_size: 0,
+        };
+
+        if self.mark_preview.has_additional_changes() {
+            PreviewResult::NeedsConfirmation
+        } else {
+            PreviewResult::NoAdditionalChanges
+        }
+    }
+
+    /// Confirm the pending unmark operation
+    pub fn confirm_unmark(&mut self) {
+        let name = self.mark_preview.package_name.clone();
+        self.apt.mark_keep(&name);
+        let _ = self.apt.resolve();
         self.mark_preview = MarkPreview::default();
         self.pending = self.apt.calculate_pending();
     }

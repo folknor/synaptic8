@@ -525,13 +525,17 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
     let preview = &app.core.mark_preview;
+    let is_marking = preview.is_marking;
 
     // Build content first to calculate height
+    let header_text = if is_marking {
+        "Marking this package requires additional changes:"
+    } else {
+        "Unmarking this package will also affect:"
+    };
+
     let mut lines = vec![
-        Line::from(Span::styled(
-            "Mark this package requires additional changes:",
-            Style::default().bold(),
-        )),
+        Line::from(Span::styled(header_text, Style::default().bold())),
         Line::from(""),
         Line::from(vec![
             Span::styled("Package: ", Style::default().fg(Color::Cyan)),
@@ -541,28 +545,38 @@ fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if !preview.additional_upgrades.is_empty() {
+        let label = if is_marking {
+            format!("The following {} packages will be UPGRADED:", preview.additional_upgrades.len())
+        } else {
+            format!("The following {} upgrades will be CANCELLED:", preview.additional_upgrades.len())
+        };
         lines.push(Line::from(Span::styled(
-            format!("The following {} packages will be UPGRADED:", preview.additional_upgrades.len()),
-            Style::default().fg(Color::Cyan).bold(),
+            label,
+            Style::default().fg(Color::Yellow).bold(),
         )));
         for name in &preview.additional_upgrades {
             lines.push(Line::from(Span::styled(
                 format!("  ↑ {}", name),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Yellow),
             )));
         }
         lines.push(Line::from(""));
     }
 
     if !preview.additional_installs.is_empty() {
+        let label = if is_marking {
+            format!("The following {} packages will be INSTALLED:", preview.additional_installs.len())
+        } else {
+            format!("The following {} installs will be CANCELLED:", preview.additional_installs.len())
+        };
         lines.push(Line::from(Span::styled(
-            format!("The following {} packages will be INSTALLED:", preview.additional_installs.len()),
-            Style::default().fg(Color::Green).bold(),
+            label,
+            Style::default().fg(if is_marking { Color::Green } else { Color::Yellow }).bold(),
         )));
         for name in &preview.additional_installs {
             lines.push(Line::from(Span::styled(
-                format!("  + {}", name),
-                Style::default().fg(Color::Green),
+                format!("  {} {}", if is_marking { "+" } else { "×" }, name),
+                Style::default().fg(if is_marking { Color::Green } else { Color::Yellow }),
             )));
         }
         lines.push(Line::from(""));
@@ -582,11 +596,13 @@ fn render_mark_confirm_modal(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Total download: {}",
-        PackageInfo::size_str(preview.download_size)
-    )));
+    if is_marking {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "Total download: {}",
+            PackageInfo::size_str(preview.download_size)
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "y/Enter: Accept │ n/Esc: Cancel │ ↑↓: Scroll",
