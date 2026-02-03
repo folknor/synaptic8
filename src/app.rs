@@ -105,23 +105,34 @@ impl App {
         Ok(app)
     }
 
-    /// Refresh UI state after core changes
+    /// Refresh UI state after core changes, preserving selection by package name
     fn refresh_ui_state(&mut self) {
+        let selected_name = self.selected_package().map(|p| p.name.clone());
         self.col_widths = self.core.rebuild_list();
-        self.reset_selection();
+        self.restore_selection(selected_name);
         self.update_cached_deps();
     }
 
-    /// Reset UI selection state
-    fn reset_selection(&mut self) {
+    /// Restore selection by package name, or reset to 0 if not found
+    fn restore_selection(&mut self, package_name: Option<String>) {
         self.ui.multi_select.clear();
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
+
+        let new_idx = package_name
+            .and_then(|name| self.core.list.iter().position(|p| p.name == name))
+            .unwrap_or(0);
+
         self.ui.table_state.select(if self.core.package_count() > 0 {
-            Some(0)
+            Some(new_idx)
         } else {
             None
         });
+    }
+
+    /// Reset UI selection state to beginning
+    fn reset_selection(&mut self) {
+        self.restore_selection(None);
     }
 
     // === Accessors ===
