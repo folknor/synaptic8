@@ -383,10 +383,9 @@ impl PackageManager {
 
     /// Unmark all packages
     pub fn unmark_all(&mut self) {
-        // Clear user marks first, then restore (which will now restore to nothing)
-        self.apt.clear_user_marks();
-        self.apt.restore_to_user_marks();
-        self.pending = self.apt.calculate_pending();
+        // Full refresh guarantees clean state - reload cache with no marks
+        let _ = self.apt.full_refresh();
+        self.pending = PendingChanges::default();
     }
 
     /// Mark multiple packages (for visual mode)
