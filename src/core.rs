@@ -383,15 +383,9 @@ impl PackageManager {
 
     /// Unmark all packages
     pub fn unmark_all(&mut self) {
-        let all_names: Vec<String> = self.apt
-            .packages(&PackageSort::default())
-            .map(|p| p.name().to_string())
-            .collect();
-
-        for name in all_names {
-            self.apt.mark_keep(&name);
-        }
+        // Clear user marks first, then restore (which will now restore to nothing)
         self.apt.clear_user_marks();
+        self.apt.restore_to_user_marks();
         self.pending = self.apt.calculate_pending();
     }
 
