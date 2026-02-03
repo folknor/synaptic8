@@ -250,6 +250,8 @@ impl App {
         // Use display name (strips native arch suffix)
         let pkg_name = self.core.cache().display_name(&pkg.name).to_string();
         let was_marked = pkg.status.is_marked();
+        // Track if this was a user-marked package (vs dependency) BEFORE toggle
+        let was_user_marked = self.core.is_user_marked(id);
 
         // Use the library's toggle() which handles cascade correctly
         let result = self.core.toggle(id);
@@ -286,6 +288,7 @@ impl App {
                         package_name: pkg_name,
                         is_upgrade: was_marked,
                         is_marking: false, // This is an unmark operation
+                        was_user_marked, // Was the original package user-marked (vs dependency)?
                         additional_installs: Vec::new(),
                         additional_upgrades: also_names, // Reuse this field for "also unmarked"
                         additional_removes: Vec::new(),
@@ -320,26 +323,46 @@ impl App {
         if let Some(ref preview) = self.mark_preview {
             if preview.is_marking {
                 // Undo a mark operation - unmark the package
-                if let Some(id) = self.core.list().iter()
-                    .find(|p| p.name == preview.package_name)
-                    .map(|p| p.id)
-                {
+                // First, find the ID using display_name comparison (immutable borrow scope)
+                let id_to_unmark = {
+                    let cache = self.core.cache();
+                    self.core.list().iter()
+                        .find(|p| cache.display_name(&p.name) == preview.package_name)
+                        .map(|p| p.id)
+                };
+                // Now mutate (borrow dropped)
+                if let Some(id) = id_to_unmark {
                     self.core.unmark(id);
                 }
             } else {
-                // Undo an unmark operation - re-mark the packages
-                // The original package name + additional_upgrades (repurposed as "also unmarked")
-                let names_to_remark: Vec<String> = std::iter::once(preview.package_name.clone())
-                    .chain(preview.additional_upgrades.iter().cloned())
-                    .collect();
+                // Undo an unmark operation - re-mark the USER-MARKED packages only
+                // Dependencies will be restored automatically by compute_plan()
+                //
+                // If original was user-marked: re-mark it (deps follow)
+                // If original was a dependency: re-mark the also_unmarked (they were user-marked)
+                let names_to_remark: Vec<String> = if preview.was_user_marked {
+                    // Original package was user-marked, re-mark only it
+                    vec![preview.package_name.clone()]
+                } else {
+                    // Original was a dependency, re-mark the user-marked packages (in also_unmarked)
+                    preview.additional_upgrades.clone()
+                };
 
-                for name in names_to_remark {
-                    if let Some(id) = self.core.list().iter()
-                        .find(|p| p.name == name)
-                        .map(|p| p.id)
-                    {
-                        self.core.mark_install(id);
-                    }
+                // First, collect all IDs to remark (immutable borrow scope)
+                let ids_to_remark: Vec<_> = {
+                    let cache = self.core.cache();
+                    names_to_remark.iter()
+                        .filter_map(|name| {
+                            self.core.list().iter()
+                                .find(|p| cache.display_name(&p.name) == *name)
+                                .map(|p| p.id)
+                        })
+                        .collect()
+                };
+
+                // Now mutate (borrow dropped)
+                for id in ids_to_remark {
+                    self.core.mark_install(id);
                 }
                 // Recompute plan after re-marking
                 self.core.compute_plan();

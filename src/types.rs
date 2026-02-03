@@ -338,6 +338,7 @@ pub struct MarkPreview {
     pub package_name: String,
     pub is_upgrade: bool, // true = package is being upgraded, false = new install
     pub is_marking: bool, // true = marking for install, false = unmarking
+    pub was_user_marked: bool, // For unmark: was the original package user-marked (vs dependency)?
     pub additional_installs: Vec<String>,
     pub additional_upgrades: Vec<String>,
     pub additional_removes: Vec<String>,

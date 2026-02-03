@@ -431,21 +431,14 @@ impl<S: ReadableState> PackageManager<S> {
         // Use full names to properly handle multi-arch packages
         let matching_fullnames: Vec<String> = {
             let search_results = &self.shared.search.results;
-            let user_intent = &self.shared.user_intent;
-            let fullname_to_id = &self.shared.cache.fullname_to_id;
 
             self.shared.cache.packages(&sort)
                 .filter(|pkg| {
                     let matches_category = match self.shared.selected_filter {
                         FilterCategory::Upgradable => pkg.is_upgradable(),
                         FilterCategory::MarkedChanges => {
-                            // Use full name for ID lookup
-                            let fullname = pkg.fullname(false);
-                            if let Some(&id) = fullname_to_id.get(&fullname) {
-                                user_intent.contains_key(&id)
-                            } else {
-                                false
-                            }
+                            // Show all packages with pending changes (user-marked OR dependencies)
+                            pkg.marked_install() || pkg.marked_upgrade() || pkg.marked_delete()
                         }
                         FilterCategory::Installed => pkg.is_installed(),
                         FilterCategory::NotInstalled => !pkg.is_installed(),
@@ -1208,6 +1201,7 @@ impl ManagerState {
             package_name: marked_pkg_name,
             is_upgrade,
             is_marking: true,
+            was_user_marked: false, // N/A for mark operations (package wasn't marked before)
             additional_installs,
             additional_upgrades,
             additional_removes,
