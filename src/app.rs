@@ -76,6 +76,7 @@ impl App {
         let mut filter_state = ListState::default();
         filter_state.select(Some(0));
 
+        let settings = Settings::default();
         let mut app = Self {
             core,
             ui: UiState {
@@ -89,7 +90,7 @@ impl App {
             details: DetailsState::default(),
             modals: ModalState::default(),
             state: AppState::Listing,
-            settings: Settings::default(),
+            settings,
             settings_selection: 0,
             col_widths: ColumnWidths::new(),
             status_message: String::from("Loading..."),
@@ -97,6 +98,8 @@ impl App {
             sudo_password: String::new(),
         };
 
+        // Sync sort settings from UI settings to core
+        app.core.set_sort(app.settings.sort_by, app.settings.sort_ascending);
         app.refresh_ui_state();
         app.update_status_message();
         Ok(app)
