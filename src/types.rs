@@ -79,7 +79,8 @@ impl FilterCategory {
 /// Displayed package info (extracted from rust-apt Package)
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub name: String,
+    pub name: String,         // Base name for APT operations (e.g., "libfoo")
+    pub display_name: String, // Display name, may include :arch suffix (e.g., "libfoo:i386")
     pub status: PackageStatus,
     pub section: String,
     pub installed_version: String,

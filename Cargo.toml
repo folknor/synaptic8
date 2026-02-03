@@ -1,8 +1,8 @@
 [package]
-name = "apt-tui"
+name = "synh8"
 version = "0.1.0"
-edition = "2021"
-description = "A simple TUI for managing apt upgrades"
+edition = "2024"
+description = "A synaptic-inspired TUI for apt management."
 
 [dependencies]
 ratatui = "0.30"

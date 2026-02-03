@@ -1,93 +1,48 @@
-# apt-tui TODO
+# synh8 TODO
 
-## Critical
+## Refactoring
 
-### Missing Core Features
-- [ ] Add ability to mark packages for removal (not just install/upgrade)
+- [ ] Use indices instead of string names for mark/unmark operations
+  ```rust
+  // In core.rs - operations take index into the list
+  pub fn toggle(&mut self, index: usize) -> ToggleResult
+  pub fn mark(&mut self, indices: &[usize]) -> PreviewResult
+  pub fn unmark(&mut self, indices: &[usize]) -> PreviewResult
+  ```
+  Benefits:
+  1. UI just passes the selected index
+  2. Core looks up `self.list[index].name` (always base name)
+  3. No string confusion between `name` and `display_name`
 
-## High Priority
+## Performance
+- [ ] Partial list updates in `apply_current_filter()` - only update changed entries instead of full rebuild
 
-### Performance
-- [ ] Consider updating only affected entries in `apply_current_filter()` instead of full rebuild
+## UI/UX
+- [ ] Scrollbar position indicator in modals - show "line X of Y" or visual marker
+- [ ] Live upgrade output - show apt output in scrolling pane instead of blank screen
+- [ ] Download progress bar - visual feedback during package fetches
+- [ ] Theming - load colors from config file
 
+## Features
+- [ ] Package removal - `-` key marks for removal, shows red `-` in status column
+- [ ] Package pinning - `=` key holds package at current version, prevents upgrades
+- [ ] Repository filter - filter by origin (main, universe, PPAs)
+- [ ] Help screen - `?` or `F1` shows keybindings grouped by context
+- [ ] Confirm mark-all - prompt before `x` marks hundreds of packages
+- [ ] Refresh package lists - `U` runs `apt update`, shows progress, refreshes view
+- [ ] Persist settings - save column visibility and sort order to ~/.config/synh8/config.toml
+- [ ] Package history - show install/upgrade dates from /var/log/apt/history.log
+- [ ] Custom filters - user-defined filters (e.g., "packages > 100MB")
+- [ ] Fix broken packages - `B` attempts to resolve broken dependencies
+- [ ] Version selection - picker when multiple candidates exist (different repos/pins)
 
-### UI/UX
-- [ ] Add scrollbar position indicator to modals
-- [ ] Live output during upgrade (async)
-- [ ] Progress bar for downloads
-- [ ] Confirm dialog styling
+## Error Messages
+- [ ] Interrupted operation - detect and show "Resuming interrupted dpkg operation"
 
-## Medium Priority
+## Polish
+- [ ] Typestate pattern - make state transitions compile-time checked
+- [ ] Remember scroll position - preserve position when switching filter categories
+- [ ] Prominent search indicator - highlight active search query in status bar
 
-### Features
-- [ ] Add package pinning/holding (prevent specific packages from upgrading)
-- [ ] Add repository/origin filter
-- [ ] Add `?` or `F1` help screen showing all keybindings
-- [ ] Add confirmation before mark-all-upgrades (`a`/`x` keys)
-- [ ] Add `apt update` equivalent (refresh package lists from repositories)
-- [ ] Show cache age / last update time
-- [ ] Add `--dry-run` command line flag
-- [ ] Persist settings to config file (~/.config/apt-tui/config.toml)
-
-### Accessibility
-- [ ] Fix color-only status differentiation (Yellow `↑` vs Green `↑` for colorblind users)
-- [ ] Use higher contrast colors for help text (DarkGray is hard to read)
-- [ ] Add `--accessible` flag for text-only status indicators
-- [ ] Add high-contrast mode option
-- [ ] Test with `NO_COLOR` environment variable
-- [ ] Theming/color customization
-
-### Error Messages
-- [ ] Show "Resuming interrupted operation" when APT detects partial commit
-
-## Low Priority
-
-### Features
-- [ ] Package history view
-- [ ] Custom filters
-- [ ] Fix broken packages option
-- [ ] Version selection (when multiple candidates exist)
-- [ ] Expose dependency resolution "fix broken" mode as user option
-
-### Polish
-- [ ] Make state transitions more explicit (typestate pattern or state machine)
-- [ ] Remember scroll position when switching filter categories
-- [ ] Make search query more visually prominent when active
-
-### Documentation
-- [ ] Man page
-- [ ] Command-line arguments (--help, --version)
-
-### Packaging
-- [ ] Debian packaging (.deb)
-- [ ] AUR package
-
-## Notes from Code Review
-
-### What's Working Well
-- Solid Rust fundamentals and idiomatic code
-- Mark-preview-apply workflow mirrors Synaptic's successful model
-- FTS5 search is arguably better than Synaptic's search
-- Color-coded status symbols with legend panel
-- Contextual help bar that changes based on state
-- Smart column width calculation based on content
-- Efficient dependency caching (only recalculates on selection change)
-- Vim-style keybindings feel natural to Linux power users
-
-### Feature Parity with Synaptic
-| Feature | apt-tui | Synaptic |
-|---------|---------|----------|
-| Filter by status | Yes | Yes |
-| Search | Yes (FTS5) | Yes |
-| Dependencies view | Yes | Yes |
-| Reverse deps | Yes | Yes |
-| Multi-select | Yes (visual mode) | Yes |
-| Package removal | No | Yes |
-| Pin/hold packages | No | Yes |
-| Repository management | No | Yes |
-| Package history | No | Yes |
-| Custom filters | No | Yes |
-| Origin/repository filter | No | Yes |
-| Fix broken packages | No | Yes |
-| Download changelogs | Yes | Yes |
-| Lock version | No | Yes |
+## Documentation
+- [ ] CLI arguments - `--help`, `--version`, `--dry-run`

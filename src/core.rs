@@ -137,21 +137,21 @@ impl PackageManager {
             }
         }
 
-        // Second pass: find duplicate names and append :arch
+        // Second pass: find duplicate names and set display_name with :arch suffix
         let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for pkg in &self.list {
             *name_counts.entry(pkg.name.clone()).or_insert(0) += 1;
         }
         for pkg in &mut self.list {
             if name_counts.get(&pkg.name).copied().unwrap_or(0) > 1 {
-                pkg.name = format!("{}:{}", pkg.name, pkg.architecture);
+                pkg.display_name = format!("{}:{}", pkg.name, pkg.architecture);
             }
         }
 
-        // Calculate column widths
+        // Calculate column widths (use display_name for width)
         let mut col_widths = ColumnWidths::new();
         for pkg in &self.list {
-            col_widths.name = col_widths.name.max(pkg.name.len() as u16);
+            col_widths.name = col_widths.name.max(pkg.display_name.len() as u16);
             col_widths.section = col_widths.section.max(pkg.section.len() as u16);
             col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
             col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
@@ -252,15 +252,11 @@ impl PackageManager {
         drop(pkg);
 
         if currently_marked {
-            // Unmarking - preview what else will be affected
-            match self.preview_unmark(name) {
-                PreviewResult::NeedsConfirmation => ToggleResult::NeedsPreview,
-                PreviewResult::NoAdditionalChanges => {
-                    self.confirm_unmark();
-                    ToggleResult::Unmarked
-                }
-                PreviewResult::Error(e) => ToggleResult::Error(e),
-            }
+            // Unmarking - just do it directly for now
+            self.apt.mark_keep(name);
+            let _ = self.apt.resolve();
+            self.pending = self.apt.calculate_pending();
+            ToggleResult::Unmarked
         } else if is_upgradable || !is_installed {
             // Need to preview
             match self.preview_mark(name) {

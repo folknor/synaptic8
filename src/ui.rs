@@ -266,7 +266,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        Cell::from(pkg.name.as_str()).style(style)
+                        Cell::from(pkg.display_name.as_str()).style(style)
                     }
                     Column::Section => Cell::from(pkg.section.as_str()),
                     Column::InstalledVersion => {
@@ -374,7 +374,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                 content.extend(vec![
                     Line::from(vec![
                         Span::styled("Package: ", Style::default().fg(Color::Cyan).bold()),
-                        Span::raw(&pkg.name),
+                        Span::raw(&pkg.display_name),
                     ]),
                     Line::from(""),
                     Line::from(vec![

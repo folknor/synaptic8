@@ -148,8 +148,10 @@ impl AptManager {
         let section = candidate.section().unwrap_or("unknown").to_string();
         let architecture = candidate.arch().to_string();
 
+        let name = pkg.name().to_string();
         Some(PackageInfo {
-            name: pkg.name().to_string(),
+            display_name: name.clone(), // Will be updated in rebuild_list if needed
+            name,
             status,
             section,
             installed_version,

@@ -45,19 +45,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
-name = "apt-tui"
-version = "0.1.0"
-dependencies = [
- "color-eyre",
- "crossterm 0.28.1",
- "libc",
- "ratatui",
- "rusqlite",
- "rust-apt",
- "zeroize",
-]
-
-[[package]]
 name = "atomic"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1528,6 +1515,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "synh8"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "crossterm 0.28.1",
+ "libc",
+ "ratatui",
+ "rusqlite",
+ "rust-apt",
+ "zeroize",
 ]
 
 [[package]]
