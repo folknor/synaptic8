@@ -23,6 +23,8 @@ pub struct AptCache {
     id_to_fullname: Vec<String>,
     /// Native architecture (e.g., "amd64")
     native_arch: String,
+    /// Cached suffix for display_name stripping (e.g., ":amd64")
+    native_arch_suffix: String,
 }
 
 impl AptCache {
@@ -49,11 +51,14 @@ impl AptCache {
             fullname_to_id.insert(fullname, id);
         }
 
+        let native_arch_suffix = format!(":{native_arch}");
+
         Ok(Self {
             cache,
             fullname_to_id,
             id_to_fullname,
             native_arch,
+            native_arch_suffix,
         })
     }
 
@@ -66,8 +71,7 @@ impl AptCache {
     /// "libfoo:amd64" -> "libfoo" (if amd64 is native)
     /// "libfoo:i386" -> "libfoo:i386" (keeps non-native arch)
     pub fn display_name<'a>(&self, fullname: &'a str) -> &'a str {
-        let suffix = format!(":{}", self.native_arch);
-        fullname.strip_suffix(&suffix).unwrap_or(fullname)
+        fullname.strip_suffix(&self.native_arch_suffix).unwrap_or(fullname)
     }
 
     // ========================================================================

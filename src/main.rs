@@ -37,6 +37,13 @@ fn main() -> Result<()> {
 
                 match app.state {
                     AppState::Listing => match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if app.has_pending_changes() {
+                                app.state = AppState::ConfirmExit;
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Char('q') => {
                             if app.has_pending_changes() {
                                 app.state = AppState::ConfirmExit;
@@ -89,20 +96,12 @@ fn main() -> Result<()> {
                             app.move_package_selection(-10);
                             app.update_visual_selection();
                         }
-                        KeyCode::Home => {
-                            app.move_package_selection(-10000);
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            app.select_first_package();
                             app.update_visual_selection();
                         }
-                        KeyCode::End => {
-                            app.move_package_selection(10000);
-                            app.update_visual_selection();
-                        }
-                        KeyCode::Char('g') => {
-                            app.move_package_selection(-10000);
-                            app.update_visual_selection();
-                        }
-                        KeyCode::Char('G') => {
-                            app.move_package_selection(10000);
+                        KeyCode::End | KeyCode::Char('G') => {
+                            app.select_last_package();
                             app.update_visual_selection();
                         }
                         KeyCode::Char(' ') => {

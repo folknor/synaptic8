@@ -163,6 +163,20 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     frame.render_widget(help, main_chunks[3]);
+
+    // Show cursor for text input states
+    match app.state {
+        AppState::Searching => {
+            // Cursor after "/<query>" in the status bar (inside border: +1 x, +1 y)
+            let cursor_x = main_chunks[2].x + 1 + 1 + app.core.search_query().len() as u16;
+            let cursor_y = main_chunks[2].y + 1;
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+        AppState::EnteringPassword => {
+            // Cursor is handled by the password modal
+        }
+        _ => {}
+    }
 }
 
 fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -176,12 +190,14 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = FilterCategory::all()
         .iter()
         .map(|cat| {
+            let count = app.core.filter_count(*cat);
+            let label = format!("{} ({})", cat.label(), count);
             let style = if *cat == app.core.selected_filter() {
                 Style::default().fg(Color::Yellow).bold()
             } else {
                 Style::default()
             };
-            ListItem::new(cat.label()).style(style)
+            ListItem::new(label).style(style)
         })
         .collect();
 
@@ -201,7 +217,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut app.ui.filter_state.clone());
+    frame.render_stateful_widget(list, chunks[0], &mut app.ui.filter_state);
 
     let legend = vec![
         Line::from(vec![
@@ -935,4 +951,9 @@ fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Center);
 
     frame.render_widget(modal, modal_area);
+
+    // Show cursor after password asterisks
+    let cursor_x = modal_area.x + (modal_area.width / 2) + (app.sudo_password.len() as u16 / 2) + 1;
+    let cursor_y = modal_area.y + 5;
+    frame.set_cursor_position((cursor_x, cursor_y));
 }

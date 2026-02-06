@@ -57,6 +57,8 @@ struct SharedState {
     search: SearchState,
     list: Vec<PackageInfo>,
     upgradable_count: usize,
+    installed_count: usize,
+    total_count: usize,
     selected_filter: FilterCategory,
     sort_settings: SortSettings,
 }
@@ -69,8 +71,27 @@ impl SharedState {
             search: SearchState::default(),
             list: Vec::new(),
             upgradable_count: 0,
+            installed_count: 0,
+            total_count: 0,
             selected_filter: FilterCategory::Upgradable,
             sort_settings: SortSettings::default(),
+        }
+    }
+
+    /// Compute and cache package counts from the APT cache
+    fn compute_cache_counts(&mut self) {
+        self.upgradable_count = 0;
+        self.installed_count = 0;
+        self.total_count = 0;
+
+        for pkg in self.cache.packages(&PackageSort::default()) {
+            self.total_count += 1;
+            if pkg.is_installed() {
+                self.installed_count += 1;
+                if pkg.is_upgradable() {
+                    self.upgradable_count += 1;
+                }
+            }
         }
     }
 }
@@ -92,7 +113,7 @@ impl PackageManager<Clean> {
     pub fn new() -> Result<Self> {
         let cache = AptCache::new()?;
         let mut shared = SharedState::new(cache);
-        shared.upgradable_count = shared.cache.count_upgradable();
+        shared.compute_cache_counts();
 
         let mut mgr = Self {
             shared,
@@ -431,14 +452,20 @@ impl<S: ReadableState> PackageManager<S> {
         // Use full names to properly handle multi-arch packages
         let matching_fullnames: Vec<String> = {
             let search_results = &self.shared.search.results;
+            let user_intent = &self.shared.user_intent;
+            let fullname_to_id = &self.shared.cache.fullname_to_id;
 
             self.shared.cache.packages(&sort)
                 .filter(|pkg| {
                     let matches_category = match self.shared.selected_filter {
                         FilterCategory::Upgradable => pkg.is_upgradable(),
                         FilterCategory::MarkedChanges => {
-                            // Show all packages with pending changes (user-marked OR dependencies)
-                            pkg.marked_install() || pkg.marked_upgrade() || pkg.marked_delete()
+                            // Check both user_intent (works in Dirty state) and
+                            // APT marks (works in Planned state for dependencies)
+                            let has_user_intent = fullname_to_id.get(&pkg.fullname(false))
+                                .map(|id| user_intent.contains_key(id))
+                                .unwrap_or(false);
+                            has_user_intent || pkg.marked_install() || pkg.marked_upgrade() || pkg.marked_delete()
                         }
                         FilterCategory::Installed => pkg.is_installed(),
                         FilterCategory::NotInstalled => !pkg.is_installed(),
@@ -479,10 +506,11 @@ impl<S: ReadableState> PackageManager<S> {
             }
         }
 
-        // Calculate column widths
+        // Calculate column widths (use display name length, not full name)
         let mut col_widths = ColumnWidths::new();
         for pkg in &self.shared.list {
-            col_widths.name = col_widths.name.max(pkg.name.len() as u16);
+            let display_len = self.shared.cache.display_name(&pkg.name).len() as u16;
+            col_widths.name = col_widths.name.max(display_len);
             col_widths.section = col_widths.section.max(pkg.section.len() as u16);
             col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
             col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
@@ -582,9 +610,9 @@ impl<S: ReadableState> PackageManager<S> {
         }
     }
 
-    /// Update upgradable count
-    pub fn update_upgradable_count(&mut self) {
-        self.shared.upgradable_count = self.shared.cache.count_upgradable();
+    /// Update all cached package counts
+    pub fn update_cache_counts(&mut self) {
+        self.shared.compute_cache_counts();
     }
 
     /// Refresh the APT cache
@@ -598,7 +626,7 @@ impl<S: ReadableState> PackageManager<S> {
         self.shared.search.index = None;
         self.shared.search.query.clear();
         self.shared.search.results = None;
-        self.update_upgradable_count();
+        self.update_cache_counts();
         Ok(())
     }
 }
@@ -874,12 +902,45 @@ impl ManagerState {
         }
     }
 
-    pub fn update_upgradable_count(&mut self) {
+    pub fn update_cache_counts(&mut self) {
         match self {
-            ManagerState::Clean(m) => m.update_upgradable_count(),
-            ManagerState::Dirty(m) => m.update_upgradable_count(),
-            ManagerState::Planned(m) => m.update_upgradable_count(),
+            ManagerState::Clean(m) => m.update_cache_counts(),
+            ManagerState::Dirty(m) => m.update_cache_counts(),
+            ManagerState::Planned(m) => m.update_cache_counts(),
             ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
+    }
+
+    /// Get the count for a filter category
+    pub fn filter_count(&self, filter: FilterCategory) -> usize {
+        let (upgradable, installed, total, user_marks) = match self {
+            ManagerState::Clean(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
+            ManagerState::Dirty(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
+            ManagerState::Planned(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        };
+
+        match filter {
+            FilterCategory::Upgradable => upgradable,
+            FilterCategory::MarkedChanges => user_marks,
+            FilterCategory::Installed => installed,
+            FilterCategory::NotInstalled => total - installed,
+            FilterCategory::All => total,
+        }
+    }
+
+    /// Mark all upgradable packages in the entire cache (not just filtered view)
+    pub fn mark_all_upgradable(&mut self) {
+        let upgradable_ids: Vec<PackageId> = {
+            let cache = self.cache();
+            cache.packages(&PackageSort::default().upgradable())
+                .map(|pkg| pkg.fullname(false))
+                .filter_map(|name| cache.get_id(&name))
+                .collect()
+        };
+
+        for id in upgradable_ids {
+            self.mark_install(id);
         }
     }
 

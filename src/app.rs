@@ -232,6 +232,11 @@ impl App {
     }
 
     pub fn move_filter_selection(&mut self, delta: i32) {
+        // Cancel visual mode since the package list is about to change
+        if self.ui.visual_mode {
+            self.cancel_visual_mode();
+        }
+
         let filters = FilterCategory::all();
         let current = self.ui.filter_state.selected().unwrap_or(0) as i32;
         let new_idx = (current + delta).clamp(0, filters.len() as i32 - 1) as usize;
@@ -250,6 +255,13 @@ impl App {
         // Use display name (strips native arch suffix)
         let pkg_name = self.core.cache().display_name(&pkg.name).to_string();
         let was_marked = pkg.status.is_marked();
+
+        // Skip toggle for installed non-upgradable packages that aren't already marked
+        if !was_marked && pkg.status == PackageStatus::Installed {
+            self.status_message = format!("{pkg_name} is already installed and up to date");
+            return;
+        }
+
         // Track if this was a user-marked package (vs dependency) BEFORE toggle
         let was_user_marked = self.core.is_user_marked(id);
 
@@ -375,13 +387,9 @@ impl App {
     }
 
     pub fn mark_all_upgrades(&mut self) {
-        // Mark all upgradable packages
-        for pkg in self.core.list().to_vec() {
-            if pkg.status == PackageStatus::Upgradable {
-                self.core.mark_install(pkg.id);
-            }
-        }
-        self.refresh_ui_state();
+        // Mark all upgradable packages in the full cache (not just filtered view)
+        self.core.mark_all_upgradable();
+        // show_changes_preview will compute_plan + rebuild, no need to refresh_ui_state here
         self.update_status_message();
         self.show_changes_preview();
     }
@@ -467,9 +475,27 @@ impl App {
         if self.core.package_count() == 0 {
             return;
         }
-        let current = self.ui.table_state.selected().unwrap_or(0) as i32;
-        let new_idx = (current + delta).clamp(0, self.core.package_count() as i32 - 1) as usize;
+        let current = self.ui.table_state.selected().unwrap_or(0) as i64;
+        let new_idx = (current + delta as i64).clamp(0, self.core.package_count() as i64 - 1) as usize;
         self.ui.table_state.select(Some(new_idx));
+        self.details.scroll = 0;
+        self.update_cached_deps();
+    }
+
+    pub fn select_first_package(&mut self) {
+        if self.core.package_count() == 0 {
+            return;
+        }
+        self.ui.table_state.select(Some(0));
+        self.details.scroll = 0;
+        self.update_cached_deps();
+    }
+
+    pub fn select_last_package(&mut self) {
+        if self.core.package_count() == 0 {
+            return;
+        }
+        self.ui.table_state.select(Some(self.core.package_count() - 1));
         self.details.scroll = 0;
         self.update_cached_deps();
     }
@@ -602,7 +628,28 @@ impl App {
 
     pub fn changes_line_count(&self) -> usize {
         match self.core.planned_changes() {
-            Some(changes) => changes.len() + 10,
+            Some(changes) => {
+                let mut lines = 2; // header + blank line
+
+                // Count changes grouped by action/reason category
+                let categories = [
+                    changes.iter().filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested).count(),
+                    changes.iter().filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested).count(),
+                    changes.iter().filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::Dependency).count(),
+                    changes.iter().filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::Dependency).count(),
+                    changes.iter().filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::UserRequested).count(),
+                    changes.iter().filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove).count(),
+                ];
+
+                for count in categories {
+                    if count > 0 {
+                        lines += 1 + count + 1; // header + items + blank
+                    }
+                }
+
+                lines += 3; // blank + download size + disk change
+                lines
+            }
             None => 5,
         }
     }

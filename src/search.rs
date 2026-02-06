@@ -63,7 +63,17 @@ impl SearchIndex {
         // Escape special FTS5 characters and add prefix matching
         let fts_query = query
             .split_whitespace()
-            .map(|word| format!("{}*", word.replace('"', "")))
+            .map(|word| {
+                let cleaned: String = word.chars()
+                    .filter(|c| !matches!(c, '"' | '*' | '^' | '(' | ')' | '{' | '}' | ':' | '+'))
+                    .collect();
+                if cleaned.is_empty() {
+                    String::new()
+                } else {
+                    format!("{cleaned}*")
+                }
+            })
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
 
