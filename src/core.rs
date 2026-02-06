@@ -1289,8 +1289,13 @@ impl ManagerState {
 
     /// Build a MarkPreview from the current Planned state's changes.
     /// Call this after marking a package and computing the plan.
-    /// Takes PackageId, derives display names from cache.
-    pub fn build_mark_preview(&self, marked_pkg_id: PackageId) -> Option<MarkPreview> {
+    /// `previously_planned` contains PackageIds that were already in the plan
+    /// before this mark — they are excluded from the "additional" lists.
+    pub fn build_mark_preview(
+        &self,
+        marked_pkg_id: PackageId,
+        previously_planned: &HashSet<PackageId>,
+    ) -> Option<MarkPreview> {
         let changes = self.planned_changes()?;
         let cache = self.cache();
 
@@ -1305,13 +1310,19 @@ impl ManagerState {
         let mut is_upgrade = false;
 
         for change in changes {
-            download_size += change.download_size;
-
             // Check if the marked package is an upgrade vs install
             if change.package == marked_pkg_id {
+                download_size += change.download_size;
                 is_upgrade = change.action == ChangeAction::Upgrade;
                 continue;
             }
+
+            // Skip packages that were already planned before this mark
+            if previously_planned.contains(&change.package) {
+                continue;
+            }
+
+            download_size += change.download_size;
 
             // Derive display name from PackageId (strips native arch suffix)
             let name = cache.fullname_of(change.package)

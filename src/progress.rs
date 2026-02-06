@@ -2,14 +2,17 @@
 //!
 //! Uses `Rc<RefCell<ProgressState>>` to share terminal access between
 //! `TuiAcquireProgress` (download phase) and `TuiInstallProgress` (install phase).
-//! Both phases render into the same ratatui terminal.
+//! Both phases render into the same ratatui terminal as a centered modal.
+//!
+//! The progress terminal writes to `/dev/tty` directly, while `StdioRedirect`
+//! redirects fd 1/2 to `/dev/null` so dpkg's stdout output is suppressed.
 
 use std::cell::RefCell;
-use std::io::Stdout;
+use std::fs::File;
 use std::rc::Rc;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::Terminal;
 use rust_apt::raw::{AcqTextStatus, ItemDesc, PkgAcquire};
 
@@ -26,67 +29,82 @@ pub enum ProgressPhase {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemStatus {
-    Hit,
-    Fetch,
-    Done,
-    Fail,
+/// RAII guard that redirects stdout/stderr to `/dev/null`.
+/// Restores the original file descriptors when dropped.
+pub struct StdioRedirect {
+    saved_stdout: libc::c_int,
+    saved_stderr: libc::c_int,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProgressItem {
-    pub label: String,
-    pub short_desc: String,
-    pub status: ItemStatus,
-    pub error: Option<String>,
+impl StdioRedirect {
+    /// Redirect stdout and stderr to `/dev/null`.
+    pub fn to_devnull() -> Self {
+        unsafe {
+            let saved_stdout = libc::dup(libc::STDOUT_FILENO);
+            let saved_stderr = libc::dup(libc::STDERR_FILENO);
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+            Self { saved_stdout, saved_stderr }
+        }
+    }
+}
+
+impl Drop for StdioRedirect {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
+            libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
+            libc::close(self.saved_stdout);
+            libc::close(self.saved_stderr);
+        }
+    }
 }
 
 /// Shared progress state, owned by `Rc<RefCell<_>>`.
+///
+/// The terminal writes to `/dev/tty` directly, bypassing stdout.
+/// This allows dpkg output (which goes to fd 1) to be suppressed via
+/// `StdioRedirect` without affecting progress rendering.
 pub struct ProgressState {
-    pub terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<File>>,
     pub phase: ProgressPhase,
     // Download phase
     pub percent: f64,
     pub current_bytes: u64,
     pub total_bytes: u64,
     pub speed_bps: u64,
-    pub items: Vec<ProgressItem>,
     // Install phase
     pub install_steps_done: u64,
     pub install_total_steps: u64,
     pub install_action: String,
     // Shared
     pub errors: Vec<String>,
-    /// Title shown in the progress box
+    /// Title shown in the modal border
     pub title: String,
 }
 
-const MAX_ITEMS: usize = 50;
-
 impl ProgressState {
-    pub fn new(terminal: Terminal<CrosstermBackend<Stdout>>, title: &str) -> Self {
-        Self {
+    pub fn new(title: &str) -> std::io::Result<Self> {
+        let tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")?;
+        let backend = CrosstermBackend::new(tty);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
             terminal,
             phase: ProgressPhase::Downloading,
             percent: 0.0,
             current_bytes: 0,
             total_bytes: 0,
             speed_bps: 0,
-            items: Vec::new(),
             install_steps_done: 0,
             install_total_steps: 0,
             install_action: String::new(),
             errors: Vec::new(),
             title: title.to_string(),
-        }
-    }
-
-    fn push_item(&mut self, item: ProgressItem) {
-        self.items.push(item);
-        if self.items.len() > MAX_ITEMS {
-            self.items.remove(0);
-        }
+        })
     }
 
     fn draw(&mut self) {
@@ -96,23 +114,20 @@ impl ProgressState {
         let current_bytes = self.current_bytes;
         let total_bytes = self.total_bytes;
         let speed_bps = self.speed_bps;
-        let items = &self.items;
         let install_steps_done = self.install_steps_done;
         let install_total_steps = self.install_total_steps;
         let install_action = &self.install_action;
         let errors = &self.errors;
         let title = &self.title;
 
-        // Ignore draw errors — terminal may be in a weird state during dpkg
         drop(self.terminal.draw(|frame| {
-            render_progress(
+            render_progress_modal(
                 frame,
                 phase,
                 percent,
                 current_bytes,
                 total_bytes,
                 speed_bps,
-                items,
                 install_steps_done,
                 install_total_steps,
                 install_action,
@@ -142,48 +157,19 @@ impl rust_apt::progress::DynAcquireProgress for TuiAcquireProgress {
         500_000 // 500ms
     }
 
-    fn hit(&mut self, item: &ItemDesc) {
-        let mut state = self.state.borrow_mut();
-        state.push_item(ProgressItem {
-            label: format!("Hit:{}", item.owner().id()),
-            short_desc: item.short_desc(),
-            status: ItemStatus::Hit,
-            error: None,
-        });
-    }
+    fn hit(&mut self, _item: &ItemDesc) {}
 
-    fn fetch(&mut self, item: &ItemDesc) {
-        let mut state = self.state.borrow_mut();
-        state.push_item(ProgressItem {
-            label: format!("Get:{}", item.owner().id()),
-            short_desc: item.short_desc(),
-            status: ItemStatus::Fetch,
-            error: None,
-        });
-    }
+    fn fetch(&mut self, _item: &ItemDesc) {}
 
-    fn done(&mut self, item: &ItemDesc) {
-        let mut state = self.state.borrow_mut();
-        state.push_item(ProgressItem {
-            label: format!("Done:{}", item.owner().id()),
-            short_desc: item.short_desc(),
-            status: ItemStatus::Done,
-            error: None,
-        });
-    }
+    fn done(&mut self, _item: &ItemDesc) {}
 
     fn fail(&mut self, item: &ItemDesc) {
         let owner = item.owner();
         let error_text = owner.error_text();
-        let mut state = self.state.borrow_mut();
-        state.push_item(ProgressItem {
-            label: format!("Err:{}", owner.id()),
-            short_desc: item.short_desc(),
-            status: ItemStatus::Fail,
-            error: Some(error_text.clone()),
-        });
         if !error_text.is_empty() {
-            state.errors.push(format!("{}: {}", item.short_desc(), error_text));
+            let mut state = self.state.borrow_mut();
+            state.errors.push(format!("{}: {error_text}", item.short_desc()));
+            state.draw();
         }
     }
 
@@ -249,18 +235,17 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
 }
 
 // ============================================================================
-// Rendering
+// Rendering — compact centered modal
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
-fn render_progress(
+fn render_progress_modal(
     frame: &mut Frame,
     phase: ProgressPhase,
     percent: f64,
     current_bytes: u64,
     total_bytes: u64,
     speed_bps: u64,
-    items: &[ProgressItem],
     install_steps_done: u64,
     install_total_steps: u64,
     install_action: &str,
@@ -269,34 +254,49 @@ fn render_progress(
 ) {
     let area = frame.area();
 
-    // Outer block
+    // Modal size: roomy when no errors, expands to show errors
+    let modal_width = 70.min(area.width.saturating_sub(4));
+    // border(1) + pad(1) + status(1) + pad(1) + gauge(1) + pad(1) + detail(1) + pad(1) + border(1)
+    let base_height: u16 = 9;
+    let error_height = if errors.is_empty() {
+        0
+    } else {
+        // 1 for separator + up to 4 error lines
+        1 + (errors.len() as u16).min(4)
+    };
+    let modal_height = (base_height + error_height).min(area.height.saturating_sub(2));
+
+    let modal_x = area.x + (area.width - modal_width) / 2;
+    let modal_y = area.y + (area.height - modal_height) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let border_color = match phase {
+        ProgressPhase::Downloading => Color::Cyan,
+        ProgressPhase::Installing => Color::Green,
+        ProgressPhase::Done => Color::Green,
+    };
     let block = Block::default()
         .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
 
-    // Split inner into: header(1), gauge(1), gap(1), log(rest), errors(if any)
-    let error_height = if errors.is_empty() { 0 } else { (errors.len() as u16).min(4) + 1 };
-    let constraints = if error_height > 0 {
-        vec![
-            Constraint::Length(1), // phase header
-            Constraint::Length(1), // progress bar
-            Constraint::Length(1), // byte counter / step counter
-            Constraint::Length(1), // gap
-            Constraint::Min(3),    // log area
-            Constraint::Length(error_height), // errors
-        ]
-    } else {
-        vec![
-            Constraint::Length(1), // phase header
-            Constraint::Length(1), // progress bar
-            Constraint::Length(1), // byte counter / step counter
-            Constraint::Length(1), // gap
-            Constraint::Min(3),    // log area
-        ]
-    };
+    // Inner layout: pad, status, pad, gauge, pad, detail, pad, [errors]
+    let mut constraints = vec![
+        Constraint::Length(1), // top padding
+        Constraint::Length(1), // status line
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // progress bar
+        Constraint::Length(1), // spacing
+        Constraint::Length(1), // detail line (bytes or action)
+        Constraint::Length(1), // bottom padding
+    ];
+    if error_height > 0 {
+        constraints.push(Constraint::Min(error_height));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -304,28 +304,28 @@ fn render_progress(
 
     match phase {
         ProgressPhase::Downloading => {
-            // Header line: "Downloading packages...  45%  2.1 MB/s"
+            // Status: "Downloading...  45%  2.1 MB/s"
             let speed_str = if speed_bps > 0 {
                 format!("  {}/s", PackageInfo::size_str(speed_bps))
             } else {
                 String::new()
             };
-            let header = Line::from(vec![
-                Span::styled("Downloading packages... ", Style::default().fg(Color::Cyan)),
+            let status = Line::from(vec![
+                Span::styled("Downloading... ", Style::default().fg(Color::Cyan)),
                 Span::styled(format!("{percent:.0}%"), Style::default().fg(Color::White).bold()),
                 Span::styled(speed_str, Style::default().fg(Color::DarkGray)),
             ]);
-            frame.render_widget(Paragraph::new(header), chunks[0]);
+            frame.render_widget(Paragraph::new(status), chunks[1]);
 
-            // Progress bar
+            // Gauge
             let ratio = (percent / 100.0).clamp(0.0, 1.0);
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
                 .ratio(ratio);
-            frame.render_widget(gauge, chunks[1]);
+            frame.render_widget(gauge, chunks[3]);
 
-            // Byte counter
-            let counter = Line::from(Span::styled(
+            // Detail: byte counter
+            let detail = Line::from(Span::styled(
                 format!(
                     "{} / {}",
                     PackageInfo::size_str(current_bytes),
@@ -333,20 +333,20 @@ fn render_progress(
                 ),
                 Style::default().fg(Color::DarkGray),
             ));
-            frame.render_widget(Paragraph::new(counter), chunks[2]);
+            frame.render_widget(Paragraph::new(detail), chunks[5]);
         }
         ProgressPhase::Installing => {
-            // Header line: "Installing packages...  Step 14 / 38"
-            let header = Line::from(vec![
-                Span::styled("Installing packages... ", Style::default().fg(Color::Green)),
+            // Status: "Installing...  Step 14 / 38"
+            let status = Line::from(vec![
+                Span::styled("Installing... ", Style::default().fg(Color::Green)),
                 Span::styled(
                     format!("Step {install_steps_done} / {install_total_steps}"),
                     Style::default().fg(Color::White).bold(),
                 ),
             ]);
-            frame.render_widget(Paragraph::new(header), chunks[0]);
+            frame.render_widget(Paragraph::new(status), chunks[1]);
 
-            // Progress bar
+            // Gauge
             let ratio = if install_total_steps > 0 {
                 (install_steps_done as f64 / install_total_steps as f64).clamp(0.0, 1.0)
             } else {
@@ -355,67 +355,31 @@ fn render_progress(
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
                 .ratio(ratio);
-            frame.render_widget(gauge, chunks[1]);
+            frame.render_widget(gauge, chunks[3]);
 
-            // Current action
-            let action = Line::from(Span::styled(
+            // Detail: current action
+            let detail = Line::from(Span::styled(
                 install_action,
                 Style::default().fg(Color::DarkGray),
             ));
-            frame.render_widget(Paragraph::new(action), chunks[2]);
+            frame.render_widget(Paragraph::new(detail), chunks[5]);
         }
         ProgressPhase::Done => {
-            let header = Line::from(Span::styled(
+            let status = Line::from(Span::styled(
                 "Complete.",
                 Style::default().fg(Color::Green).bold(),
             ));
-            frame.render_widget(Paragraph::new(header), chunks[0]);
+            frame.render_widget(Paragraph::new(status), chunks[1]);
 
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
                 .ratio(1.0);
-            frame.render_widget(gauge, chunks[1]);
+            frame.render_widget(gauge, chunks[3]);
         }
     }
 
-    // Log area — show recent items, bottom-aligned
-    let log_height = chunks[4].height as usize;
-    let visible_items = if items.len() > log_height {
-        &items[items.len() - log_height..]
-    } else {
-        items
-    };
-    let log_lines: Vec<Line> = visible_items
-        .iter()
-        .map(|item| {
-            let (prefix_style, desc_style) = match item.status {
-                ItemStatus::Hit => (
-                    Style::default().fg(Color::Green),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                ItemStatus::Fetch => (
-                    Style::default().fg(Color::Cyan),
-                    Style::default().fg(Color::White),
-                ),
-                ItemStatus::Done => (
-                    Style::default().fg(Color::Green),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                ItemStatus::Fail => (
-                    Style::default().fg(Color::Red),
-                    Style::default().fg(Color::Red),
-                ),
-            };
-            Line::from(vec![
-                Span::styled(format!("{} ", item.label), prefix_style),
-                Span::styled(&item.short_desc, desc_style),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(log_lines), chunks[4]);
-
-    // Errors area (if any)
-    if error_height > 0 && chunks.len() > 5 {
+    // Errors section (only shown when errors exist)
+    if error_height > 0 && chunks.len() > 7 {
         let error_lines: Vec<Line> = errors
             .iter()
             .rev()
@@ -423,13 +387,8 @@ fn render_progress(
             .rev()
             .map(|e| Line::from(Span::styled(e.as_str(), Style::default().fg(Color::Red))))
             .collect();
-        let error_block = Block::default()
-            .title(" Errors ")
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Red));
         let error_para = Paragraph::new(error_lines)
-            .block(error_block)
             .wrap(Wrap { trim: false });
-        frame.render_widget(error_para, chunks[5]);
+        frame.render_widget(error_para, chunks[7]);
     }
 }

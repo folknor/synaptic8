@@ -5,14 +5,11 @@
 
 use std::collections::HashSet;
 
-use std::io::Stdout;
-
 use color_eyre::Result;
-use ratatui::prelude::*;
 use ratatui::widgets::{ListState, TableState};
 
 use synh8::core::{ManagerState, check_apt_lock};
-use synh8::progress::{ProgressState, TuiAcquireProgress, TuiInstallProgress};
+use synh8::progress::{ProgressState, StdioRedirect, TuiAcquireProgress, TuiInstallProgress};
 use synh8::types::*;
 
 /// UI widget state for the main views
@@ -266,6 +263,12 @@ impl App {
         // Track if this was a user-marked package (vs dependency) BEFORE toggle
         let was_user_marked = self.core.is_user_marked(id);
 
+        // Snapshot currently planned packages BEFORE the toggle so we can
+        // show only the NEW dependencies in the confirmation modal
+        let previously_planned: HashSet<PackageId> = self.core.planned_changes()
+            .map(|changes| changes.iter().map(|c| c.package).collect())
+            .unwrap_or_default();
+
         // Use the library's toggle() which handles cascade correctly
         let result = self.core.toggle(id);
 
@@ -277,8 +280,8 @@ impl App {
                     self.refresh_ui_state();
                     self.update_status_message();
                 } else {
-                    // Build preview for confirmation modal
-                    let preview = self.core.build_mark_preview(id);
+                    // Build preview for confirmation modal (only new deps)
+                    let preview = self.core.build_mark_preview(id, &previously_planned);
                     self.mark_preview = preview;
                     self.mark_preview_scroll = 0;
                     self.state = AppState::ShowingMarkConfirm;
@@ -696,18 +699,17 @@ impl App {
     // === System operations ===
 
     /// Commit planned changes with live TUI progress display.
-    /// Takes ownership of the terminal, returns it when done.
-    pub fn commit_changes_live(
-        &mut self,
-        terminal: Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    ///
+    /// Creates its own `/dev/tty`-backed terminal for the progress modal and
+    /// redirects stdout/stderr to `/dev/null` so dpkg output is suppressed.
+    pub fn commit_changes_live(&mut self) -> Result<()> {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         self.state = AppState::Upgrading;
 
         let progress_state = Rc::new(RefCell::new(
-            ProgressState::new(terminal, "Applying Changes"),
+            ProgressState::new("Applying Changes")?,
         ));
 
         let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
@@ -715,6 +717,10 @@ impl App {
 
         let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
         let mut install_progress = rust_apt::progress::InstallProgress::new(inst);
+
+        // Redirect stdout/stderr to /dev/null so dpkg output is suppressed.
+        // The progress terminal writes to /dev/tty directly, bypassing fd 1.
+        let _redirect = StdioRedirect::to_devnull();
 
         match self.core.commit_with_progress(&mut acquire_progress, &mut install_progress) {
             Ok(()) => {
@@ -729,31 +735,24 @@ impl App {
             }
         }
 
-        // Recover terminal from progress state
-        drop(acquire_progress);
-        drop(install_progress);
-        let state = Rc::into_inner(progress_state)
-            .expect("progress references should be dropped")
-            .into_inner();
-        Ok(state.terminal)
+        // _redirect drops here, restoring stdout/stderr
+        Ok(())
     }
 
     /// Run `apt update` with live TUI progress display.
-    /// Takes ownership of the terminal, returns it when done.
-    pub fn update_packages_live(
-        &mut self,
-        terminal: Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    ///
+    /// Creates its own `/dev/tty`-backed terminal for the progress modal.
+    pub fn update_packages_live(&mut self) -> Result<()> {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         if let Some(msg) = check_apt_lock() {
             self.status_message = msg;
-            return Ok(terminal);
+            return Ok(());
         }
 
         let progress_state = Rc::new(RefCell::new(
-            ProgressState::new(terminal, "Updating Package Lists"),
+            ProgressState::new("Updating Package Lists")?,
         ));
 
         let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
@@ -772,12 +771,7 @@ impl App {
             }
         }
 
-        // Recover terminal from progress state
-        drop(acquire_progress);
-        let state = Rc::into_inner(progress_state)
-            .expect("progress references should be dropped")
-            .into_inner();
-        Ok(state.terminal)
+        Ok(())
     }
 
     pub fn refresh_cache(&mut self) -> Result<()> {

@@ -47,7 +47,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(19),
+                    Constraint::Length(24),
                     Constraint::Min(40),
                     Constraint::Length(35),
                 ])
@@ -61,7 +61,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(19),
+                    Constraint::Length(24),
                     Constraint::Min(40),
                     Constraint::Length(35),
                 ])
@@ -87,7 +87,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(19),
+                    Constraint::Length(24),
                     Constraint::Min(40),
                     Constraint::Length(35),
                 ])

@@ -127,7 +127,8 @@ fn main() -> Result<()> {
                         KeyCode::Char('N') => app.unmark_all(),
                         KeyCode::Char('U') => {
                             // apt update with live progress
-                            terminal = app.update_packages_live(terminal)?;
+                            app.update_packages_live()?;
+                            terminal.clear()?;
                         }
                         KeyCode::Char('r') => {
                             if let Err(e) = app.refresh_cache() {
@@ -162,8 +163,10 @@ fn main() -> Result<()> {
                     },
                     AppState::ShowingChanges => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
-                            // Commit with live TUI progress - terminal is transferred
-                            terminal = app.commit_changes_live(terminal)?;
+                            // Clear the confirmation dialog before showing progress
+                            terminal.clear()?;
+                            app.commit_changes_live()?;
+                            terminal.clear()?;
                         }
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.state = AppState::Listing;
