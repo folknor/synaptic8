@@ -223,6 +223,10 @@ fn main() -> Result<()> {
                                 app.status_message = format!("Refresh failed: {e}");
                             }
                         }
+                        KeyCode::Up | KeyCode::Char('k') => app.scroll_output(-1),
+                        KeyCode::Down | KeyCode::Char('j') => app.scroll_output(1),
+                        KeyCode::PageUp => app.scroll_output(-10),
+                        KeyCode::PageDown => app.scroll_output(10),
                         _ => {}
                     },
                 }

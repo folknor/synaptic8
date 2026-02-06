@@ -29,25 +29,43 @@ pub enum ProgressPhase {
     Done,
 }
 
-/// RAII guard that redirects stdout/stderr to `/dev/null`.
+/// RAII guard that redirects stdout/stderr to a temp file.
 /// Restores the original file descriptors when dropped.
 pub struct StdioRedirect {
     saved_stdout: libc::c_int,
     saved_stderr: libc::c_int,
+    capture_path: std::path::PathBuf,
 }
 
 impl StdioRedirect {
-    /// Redirect stdout and stderr to `/dev/null`.
-    pub fn to_devnull() -> Self {
+    /// Redirect stdout and stderr to a temp file for later retrieval.
+    pub fn capture() -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let capture_path = std::env::temp_dir().join("synh8-apt-output.tmp");
         unsafe {
             let saved_stdout = libc::dup(libc::STDOUT_FILENO);
             let saved_stderr = libc::dup(libc::STDERR_FILENO);
-            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-            libc::dup2(devnull, libc::STDOUT_FILENO);
-            libc::dup2(devnull, libc::STDERR_FILENO);
-            libc::close(devnull);
-            Self { saved_stdout, saved_stderr }
+
+            let file = std::fs::File::create(&capture_path)?;
+            let capture_fd = file.as_raw_fd();
+            libc::dup2(capture_fd, libc::STDOUT_FILENO);
+            libc::dup2(capture_fd, libc::STDERR_FILENO);
+            // file drops here closing capture_fd, but the dup'd fds keep it open
+
+            Ok(Self { saved_stdout, saved_stderr, capture_path })
         }
+    }
+
+    /// Read the captured output.
+    pub fn output(&self) -> Vec<String> {
+        // Flush C stdio buffers so all libapt output is written to the file
+        unsafe { libc::fflush(std::ptr::null_mut()); }
+        std::fs::read_to_string(&self.capture_path)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
     }
 }
 
@@ -59,6 +77,7 @@ impl Drop for StdioRedirect {
             libc::close(self.saved_stdout);
             libc::close(self.saved_stderr);
         }
+        drop(std::fs::remove_file(&self.capture_path));
     }
 }
 

@@ -71,6 +71,7 @@ pub struct App {
     /// Mark preview state (shown before confirming package mark)
     pub mark_preview: Option<MarkPreview>,
     pub mark_preview_scroll: usize,
+    pub output_scroll: u16,
 }
 
 impl App {
@@ -100,6 +101,7 @@ impl App {
             output_lines: Vec::new(),
             mark_preview: None,
             mark_preview_scroll: 0,
+            output_scroll: 0,
         };
 
         // Sync sort settings from UI settings to core
@@ -629,6 +631,12 @@ impl App {
         self.mark_preview_scroll = (current + delta).clamp(0, max_scroll as i32) as usize;
     }
 
+    pub fn scroll_output(&mut self, delta: i32) {
+        let max_scroll = self.output_lines.len().saturating_sub(1) as u16;
+        let current = self.output_scroll as i32;
+        self.output_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+    }
+
     pub fn changes_line_count(&self) -> usize {
         match self.core.planned_changes() {
             Some(changes) => {
@@ -718,24 +726,38 @@ impl App {
         let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
         let mut install_progress = rust_apt::progress::InstallProgress::new(inst);
 
-        // Redirect stdout/stderr to /dev/null so dpkg output is suppressed.
-        // The progress terminal writes to /dev/tty directly, bypassing fd 1.
-        let _redirect = StdioRedirect::to_devnull();
+        // Tell dpkg to keep existing config files without prompting.
+        // Without this, dpkg's conffile prompt would deadlock since we've
+        // captured stdout and it can't interact with the user.
+        let config = rust_apt::config::Config::new();
+        config.set_vector("Dpkg::Options", &vec!["--force-confdef", "--force-confold"]);
 
-        match self.core.commit_with_progress(&mut acquire_progress, &mut install_progress) {
+        // Suppress debconf prompts (use package defaults).
+        // Safety: we're single-threaded, no concurrent env reads.
+        unsafe { std::env::set_var("DEBIAN_FRONTEND", "noninteractive"); }
+
+        // Redirect stdout/stderr to a temp file so dpkg output is captured.
+        // The progress terminal writes to /dev/tty directly, bypassing fd 1.
+        let redirect = StdioRedirect::capture()?;
+
+        let result = self.core.commit_with_progress(&mut acquire_progress, &mut install_progress);
+
+        // Read captured apt/dpkg output before restoring fds
+        self.output_lines = redirect.output();
+        self.output_scroll = 0;
+
+        match result {
             Ok(()) => {
-                self.output_lines.push("Changes applied successfully.".to_string());
                 self.state = AppState::Done;
-                self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
+                self.status_message = "Changes applied successfully. Press 'q' to quit or 'r' to refresh.".to_string();
             }
             Err(e) => {
-                self.output_lines.push(format!("Error: {e}"));
                 self.state = AppState::Done;
                 self.status_message = format!("Error: {e}. Press 'q' to quit or 'r' to refresh.");
             }
         }
 
-        // _redirect drops here, restoring stdout/stderr
+        // redirect drops here, restoring stdout/stderr and cleaning up temp file
         Ok(())
     }
 

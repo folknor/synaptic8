@@ -100,10 +100,15 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_exit_confirm_modal(frame, app, main_chunks[1]);
         }
         AppState::Upgrading | AppState::Done => {
-            let output_text = app.output_lines.join("\n");
-            let output = Paragraph::new(output_text)
-                .block(Block::default().title(" Output ").borders(Borders::ALL))
-                .wrap(Wrap { trim: false });
+            let lines: Vec<Line> = app.output_lines
+                .iter()
+                .map(|s| Line::from(s.as_str()))
+                .collect();
+            let output = Paragraph::new(lines)
+                .block(Block::default().title(" APT Output ").borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)))
+                .wrap(Wrap { trim: false })
+                .scroll((app.output_scroll, 0));
             frame.render_widget(output, main_chunks[1]);
         }
     }
@@ -152,7 +157,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
         AppState::ConfirmExit => "y/Enter:Quit │ n/Esc:Cancel",
         AppState::Upgrading => "Applying changes...",
-        AppState::Done => "r:Refresh │ q:Quit",
+        AppState::Done => "↑↓/PgUp/PgDn:Scroll │ r:Refresh │ q:Quit",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))

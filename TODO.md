@@ -87,6 +87,17 @@
 - [ ] Custom filters - user-defined filters (e.g., "packages > 100MB")
 - [ ] Fix broken packages - `B` attempts to resolve broken dependencies
 - [ ] Version selection - picker when multiple candidates exist (different repos/pins)
+- [ ] Debconf integration - currently `DEBIAN_FRONTEND=noninteractive` suppresses all
+  debconf prompts (e.g., "really remove running kernel?"). A proper integration would
+  write a custom debconf frontend that forwards the debconf protocol to our process
+  over a unix socket/named pipe, parses the ~12 protocol commands, and presents
+  questions as TUI modals. The debconf protocol is simple text-based (`INPUT`,
+  `GO`, `GET`, `SET`, etc.) — the hard part is the plumbing between a subprocess
+  spawned deep inside dpkg and our main event loop.
+- [ ] Conffile prompt handling - currently `--force-confdef --force-confold` keeps
+  existing config files without prompting. rust-apt's `DynInstallProgress` doesn't
+  expose dpkg's `conffile` status-fd message. If rust-apt adds a `conffile()` callback,
+  we could present a TUI modal asking keep/replace/diff.
 
 ## Error Messages
 
