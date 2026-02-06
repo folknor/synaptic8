@@ -367,6 +367,23 @@ impl PackageManager<Planned> {
             _phantom: PhantomData,
         })
     }
+
+    /// Commit the changes using caller-provided progress implementations
+    pub fn commit_with_progress(
+        mut self,
+        acquire_progress: &mut rust_apt::progress::AcquireProgress,
+        install_progress: &mut rust_apt::progress::InstallProgress,
+    ) -> Result<PackageManager<Clean>> {
+        self.shared.cache.commit_with_progress(acquire_progress, install_progress)?;
+        self.shared.user_intent.clear();
+        self.shared.search.index = None;
+
+        Ok(PackageManager {
+            shared: self.shared,
+            state: Clean,
+            _phantom: PhantomData,
+        })
+    }
 }
 
 // ============================================================================
@@ -622,6 +639,25 @@ impl<S: ReadableState> PackageManager<S> {
         }
 
         self.shared.cache.refresh().map_err(|e| e.to_string())?;
+        self.shared.user_intent.clear();
+        self.shared.search.index = None;
+        self.shared.search.query.clear();
+        self.shared.search.results = None;
+        self.update_cache_counts();
+        Ok(())
+    }
+
+    /// Run `apt update` with caller-provided progress, then refresh
+    pub fn update_with_progress(
+        &mut self,
+        acquire_progress: &mut rust_apt::progress::AcquireProgress,
+    ) -> Result<(), String> {
+        if let Some(msg) = check_apt_lock() {
+            return Err(msg);
+        }
+
+        self.shared.cache.update_with_progress(acquire_progress)
+            .map_err(|e| e.to_string())?;
         self.shared.user_intent.clear();
         self.shared.search.index = None;
         self.shared.search.query.clear();
@@ -1124,10 +1160,9 @@ impl ManagerState {
         let intent_ids: Vec<PackageId> = self.user_intent_ids().copied().collect();
 
         for intent_id in intent_ids {
-            if let Some(intent_name) = cache.fullname_of(intent_id) {
-                if self.package_depends_on(intent_name, target_base) {
+            if let Some(intent_name) = cache.fullname_of(intent_id)
+                && self.package_depends_on(intent_name, target_base) {
                     result.push(intent_id);
-                }
             }
         }
 
@@ -1158,11 +1193,9 @@ impl ManagerState {
 
                 // Add to check list for transitive deps
                 if let Some(&dep_id) = cache.fullname_to_id.get(&dep_name)
-                    .or_else(|| cache.fullname_to_id.get(&format!("{}:amd64", dep_name)))
-                {
-                    if let Some(fullname) = cache.fullname_of(dep_id) {
+                    .or_else(|| cache.fullname_to_id.get(&format!("{dep_name}:amd64")))
+                    && let Some(fullname) = cache.fullname_of(dep_id) {
                         to_check.push(fullname.to_string());
-                    }
                 }
             }
         }
@@ -1217,6 +1250,41 @@ impl ManagerState {
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
         Ok(())
+    }
+
+    /// Commit planned changes with caller-provided progress implementations
+    pub fn commit_with_progress(
+        &mut self,
+        acquire_progress: &mut rust_apt::progress::AcquireProgress,
+        install_progress: &mut rust_apt::progress::InstallProgress,
+    ) -> Result<()> {
+        *self = match std::mem::take(self) {
+            ManagerState::Clean(m) => ManagerState::Clean(m),
+            ManagerState::Dirty(m) => {
+                let planned = m.plan();
+                let clean = planned.commit_with_progress(acquire_progress, install_progress)?;
+                ManagerState::Clean(clean)
+            }
+            ManagerState::Planned(m) => {
+                let clean = m.commit_with_progress(acquire_progress, install_progress)?;
+                ManagerState::Clean(clean)
+            }
+            ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
+        };
+        Ok(())
+    }
+
+    /// Run `apt update` with caller-provided progress
+    pub fn update_with_progress(
+        &mut self,
+        acquire_progress: &mut rust_apt::progress::AcquireProgress,
+    ) -> Result<(), String> {
+        match self {
+            ManagerState::Clean(m) => m.update_with_progress(acquire_progress),
+            ManagerState::Dirty(m) => m.update_with_progress(acquire_progress),
+            ManagerState::Planned(m) => m.update_with_progress(acquire_progress),
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
     }
 
     /// Build a MarkPreview from the current Planned state's changes.

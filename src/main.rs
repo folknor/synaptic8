@@ -11,14 +11,18 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
-use zeroize::Zeroize;
-
 use app::App;
+use synh8::core::is_root;
 use synh8::types::*;
 use ui::ui;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+
+    if !is_root() {
+        eprintln!("synh8 must be run as root. Try: sudo {}", std::env::args().next().unwrap_or_else(|| "synh8".into()));
+        std::process::exit(1);
+    }
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -121,6 +125,10 @@ fn main() -> Result<()> {
                         KeyCode::Char('u') => app.show_changes_preview(),
                         KeyCode::Char('x') => app.mark_all_upgrades(),
                         KeyCode::Char('N') => app.unmark_all(),
+                        KeyCode::Char('U') => {
+                            // apt update with live progress
+                            terminal = app.update_packages_live(terminal)?;
+                        }
                         KeyCode::Char('r') => {
                             if let Err(e) = app.refresh_cache() {
                                 app.status_message = format!("Refresh failed: {e}");
@@ -154,25 +162,8 @@ fn main() -> Result<()> {
                     },
                     AppState::ShowingChanges => match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
-                            match app.apply_changes() {
-                                ApplyResult::NeedsPassword => {
-                                    // Will show password dialog
-                                }
-                                ApplyResult::NeedsCommit => {
-                                    // Exit TUI, run commit, return
-                                    disable_raw_mode()?;
-                                    io::stdout().execute(LeaveAlternateScreen)?;
-
-                                    if let Err(e) = app.commit_changes() {
-                                        eprintln!("Error: {e}");
-                                    }
-
-                                    // Return to TUI
-                                    enable_raw_mode()?;
-                                    io::stdout().execute(EnterAlternateScreen)?;
-                                    terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-                                }
-                            }
+                            // Commit with live TUI progress - terminal is transferred
+                            terminal = app.commit_changes_live(terminal)?;
                         }
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.state = AppState::Listing;
@@ -197,33 +188,6 @@ fn main() -> Result<()> {
                         KeyCode::Char('y') | KeyCode::Enter => break,
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.state = AppState::Listing;
-                        }
-                        _ => {}
-                    },
-                    AppState::EnteringPassword => match key.code {
-                        KeyCode::Esc => {
-                            app.sudo_password.zeroize();
-                            app.state = AppState::ShowingChanges;
-                        }
-                        KeyCode::Enter => {
-                            // Exit TUI, run sudo commit, return
-                            disable_raw_mode()?;
-                            io::stdout().execute(LeaveAlternateScreen)?;
-
-                            if let Err(e) = app.commit_with_sudo() {
-                                eprintln!("Error: {e}");
-                            }
-
-                            // Return to TUI
-                            enable_raw_mode()?;
-                            io::stdout().execute(EnterAlternateScreen)?;
-                            terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-                        }
-                        KeyCode::Backspace => {
-                            app.sudo_password.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.sudo_password.push(c);
                         }
                         _ => {}
                     },

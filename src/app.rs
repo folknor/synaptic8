@@ -5,11 +5,14 @@
 
 use std::collections::HashSet;
 
-use color_eyre::Result;
-use ratatui::widgets::{ListState, TableState};
-use zeroize::Zeroize;
+use std::io::Stdout;
 
-use synh8::core::{ManagerState, is_root, check_apt_lock};
+use color_eyre::Result;
+use ratatui::prelude::*;
+use ratatui::widgets::{ListState, TableState};
+
+use synh8::core::{ManagerState, check_apt_lock};
+use synh8::progress::{ProgressState, TuiAcquireProgress, TuiInstallProgress};
 use synh8::types::*;
 
 /// UI widget state for the main views
@@ -67,7 +70,6 @@ pub struct App {
     pub col_widths: ColumnWidths,
     pub status_message: String,
     pub output_lines: Vec<String>,
-    pub sudo_password: String,
 
     /// Mark preview state (shown before confirming package mark)
     pub mark_preview: Option<MarkPreview>,
@@ -99,7 +101,6 @@ impl App {
             col_widths: ColumnWidths::new(),
             status_message: String::from("Loading..."),
             output_lines: Vec::new(),
-            sudo_password: String::new(),
             mark_preview: None,
             mark_preview_scroll: 0,
         };
@@ -315,8 +316,7 @@ impl App {
                 // Couldn't unmark - it's a dependency we can't trace
                 // Tell user to unmark the original package instead
                 self.status_message = format!(
-                    "{} is a dependency - unmark the package that requires it",
-                    pkg_name
+                    "{pkg_name} is a dependency - unmark the package that requires it"
                 );
                 self.refresh_ui_state();
             }
@@ -695,132 +695,89 @@ impl App {
 
     // === System operations ===
 
-    #[must_use]
-    pub fn is_root() -> bool {
-        is_root()
-    }
-
-    pub fn apply_changes(&mut self) -> ApplyResult {
-        if !Self::is_root() {
-            self.sudo_password.zeroize();
-            self.state = AppState::EnteringPassword;
-            return ApplyResult::NeedsPassword;
-        }
+    /// Commit planned changes with live TUI progress display.
+    /// Takes ownership of the terminal, returns it when done.
+    pub fn commit_changes_live(
+        &mut self,
+        terminal: Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
         self.state = AppState::Upgrading;
-        ApplyResult::NeedsCommit
-    }
 
-    pub fn commit_changes(&mut self) -> Result<()> {
-        println!("\n=== Applying changes ===\n");
+        let progress_state = Rc::new(RefCell::new(
+            ProgressState::new(terminal, "Applying Changes"),
+        ));
 
-        match self.core.commit() {
+        let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
+        let inst = TuiInstallProgress::new(Rc::clone(&progress_state));
+
+        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
+        let mut install_progress = rust_apt::progress::InstallProgress::new(inst);
+
+        match self.core.commit_with_progress(&mut acquire_progress, &mut install_progress) {
             Ok(()) => {
-                println!("\n=== Changes applied successfully ===");
                 self.output_lines.push("Changes applied successfully.".to_string());
                 self.state = AppState::Done;
                 self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
             }
             Err(e) => {
-                println!("\n=== Error applying changes ===");
-                println!("{e}");
                 self.output_lines.push(format!("Error: {e}"));
                 self.state = AppState::Done;
                 self.status_message = format!("Error: {e}. Press 'q' to quit or 'r' to refresh.");
             }
         }
 
-        Ok(())
+        // Recover terminal from progress state
+        drop(acquire_progress);
+        drop(install_progress);
+        let state = Rc::into_inner(progress_state)
+            .expect("progress references should be dropped")
+            .into_inner();
+        Ok(state.terminal)
     }
 
-    pub fn commit_with_sudo(&mut self) -> Result<()> {
-        use std::io::{Read, Write};
-        use std::process::{Command, Stdio};
+    /// Run `apt update` with live TUI progress display.
+    /// Takes ownership of the terminal, returns it when done.
+    pub fn update_packages_live(
+        &mut self,
+        terminal: Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
-        println!("\n=== Applying changes with sudo ===\n");
+        if let Some(msg) = check_apt_lock() {
+            self.status_message = msg;
+            return Ok(terminal);
+        }
 
-        // Compute plan if not already done
-        self.core.compute_plan();
+        let progress_state = Rc::new(RefCell::new(
+            ProgressState::new(terminal, "Updating Package Lists"),
+        ));
 
-        let mut args = vec!["apt-get".to_string(), "-y".to_string()];
+        let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
+        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
 
-        // Get planned changes - derive names from PackageId
-        let (to_install, to_remove): (Vec<String>, Vec<String>) = match self.core.planned_changes() {
-            Some(changes) => {
-                let cache = self.core.cache();
-                let install: Vec<String> = changes.iter()
-                    .filter(|c| c.action == ChangeAction::Install || c.action == ChangeAction::Upgrade)
-                    .filter_map(|c| cache.fullname_of(c.package).map(String::from))
-                    .collect();
-                let remove: Vec<String> = changes.iter()
-                    .filter(|c| c.action == ChangeAction::Remove)
-                    .filter_map(|c| cache.fullname_of(c.package).map(|n| format!("{n}-")))
-                    .collect();
-                (install, remove)
+        match self.core.update_with_progress(&mut acquire_progress) {
+            Ok(()) => {
+                // Rebuild package list and counts after update
+                self.core.rebuild_list();
+                self.core.update_cache_counts();
+                self.apply_current_filter();
+                self.update_status_message();
             }
-            None => (Vec::new(), Vec::new()),
-        };
-
-        if !to_install.is_empty() || !to_remove.is_empty() {
-            args.push("install".to_string());
-            for pkg in &to_install {
-                args.push(pkg.clone());
-            }
-            for pkg in &to_remove {
-                args.push(pkg.clone());
+            Err(e) => {
+                self.status_message = format!("Update failed: {e}");
             }
         }
 
-        let mut child = Command::new("/usr/bin/sudo")
-            .arg("-S")
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            writeln!(stdin, "{}", self.sudo_password)?;
-        }
-
-        self.sudo_password.zeroize();
-
-        let mut stderr_output = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            // Intentionally ignore read errors - stderr capture is best-effort
-            drop(stderr.read_to_string(&mut stderr_output));
-        }
-
-        let status = child.wait()?;
-
-        if status.success() {
-            println!("\n=== Changes applied successfully ===");
-            self.output_lines.push("Changes applied successfully.".to_string());
-            self.state = AppState::Done;
-            self.status_message = "Done. Press 'q' to quit or 'r' to refresh.".to_string();
-            // Reset to clean state
-            self.core.reset();
-        } else {
-            println!("\n=== Error applying changes ===");
-            if !stderr_output.is_empty() {
-                let filtered_err: String = stderr_output
-                    .lines()
-                    .filter(|line| !line.contains("[sudo] password"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !filtered_err.is_empty() {
-                    println!("{filtered_err}");
-                    self.output_lines.push(format!("Error: {}", filtered_err.lines().next().unwrap_or("apt-get failed")));
-                } else {
-                    self.output_lines.push("Error: apt-get failed (wrong password?)".to_string());
-                }
-            } else {
-                self.output_lines.push("Error: apt-get failed".to_string());
-            }
-            self.state = AppState::Done;
-            self.status_message = "Error: apt-get failed. Press 'q' to quit or 'r' to refresh.".to_string();
-        }
-
-        Ok(())
+        // Recover terminal from progress state
+        drop(acquire_progress);
+        let state = Rc::into_inner(progress_state)
+            .expect("progress references should be dropped")
+            .into_inner();
+        Ok(state.terminal)
     }
 
     pub fn refresh_cache(&mut self) -> Result<()> {

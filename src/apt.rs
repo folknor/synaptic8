@@ -340,7 +340,7 @@ impl AptCache {
         Ok(())
     }
 
-    /// Commit changes using native APT progress
+    /// Commit changes using native APT progress (text output)
     pub(crate) fn commit(&mut self) -> Result<()> {
         let mut acquire_progress = AcquireProgress::apt();
         let mut install_progress = InstallProgress::apt();
@@ -348,6 +348,29 @@ impl AptCache {
         let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
         cache.commit(&mut acquire_progress, &mut install_progress)?;
 
+        Ok(())
+    }
+
+    /// Commit changes using caller-provided progress implementations
+    pub(crate) fn commit_with_progress(
+        &mut self,
+        acquire_progress: &mut AcquireProgress,
+        install_progress: &mut InstallProgress,
+    ) -> Result<()> {
+        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+        cache.commit(acquire_progress, install_progress)?;
+        Ok(())
+    }
+
+    /// Run `apt update` (refresh package lists) with caller-provided progress
+    pub(crate) fn update_with_progress(
+        &mut self,
+        acquire_progress: &mut AcquireProgress,
+    ) -> Result<()> {
+        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+        cache.update(acquire_progress)?;
+        // Reload cache after update to pick up new package lists
+        self.cache = Cache::new::<&str>(&[])?;
         Ok(())
     }
 }

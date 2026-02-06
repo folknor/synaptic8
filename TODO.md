@@ -50,8 +50,11 @@
 ## UI/UX
 
 - [ ] Scrollbar position indicator in modals - show "line X of Y" or visual marker
-- [ ] Live upgrade output - show apt output in scrolling pane instead of blank screen
-- [ ] Download progress bar - visual feedback during package fetches
+- [x] Live upgrade output - TUI progress display during commit using rust-apt's
+  native `DynAcquireProgress` and `DynInstallProgress` callbacks. Shows download
+  progress bar with speed/bytes and install progress with step counter.
+- [x] Download progress bar - integrated into the live upgrade progress display.
+  Uses `Rc<RefCell<ProgressState>>` to share terminal between download and install phases.
 - [ ] Theming - load colors from config file
 - [ ] Navigation keys ignore focused pane (DEFERRED) - PageUp/PageDown/Home/End/g/G
   always move the package list even when the filter or details pane is focused. Up/Down
@@ -77,7 +80,8 @@
 - [ ] Repository filter - filter by origin (main, universe, PPAs)
 - [ ] Help screen - `?` or `F1` shows keybindings grouped by context
 - [ ] Confirm mark-all - prompt before `x` marks hundreds of packages
-- [ ] Refresh package lists - `U` runs `apt update`, shows progress, refreshes view
+- [x] Refresh package lists - `U` runs `apt update` with live TUI download progress,
+  then refreshes the package list view. Uses the same progress rendering as commit.
 - [ ] Persist settings - save column visibility and sort order to ~/.config/synh8/config.toml
 - [ ] Package history - show install/upgrade dates from /var/log/apt/history.log
 - [ ] Custom filters - user-defined filters (e.g., "packages > 100MB")
@@ -117,3 +121,7 @@
 - [x] Changes modal scroll limits computed accurately
 - [x] Toggle feedback for installed non-upgradable packages
 - [x] Visual mode cancelled on filter change
+- [x] Live TUI progress for package commit (download + install phases)
+- [x] `U` key runs `apt update` with live download progress
+- [x] Root-only mode - app requires root, removed sudo subprocess and password dialog
+- [x] Removed `zeroize` dependency (no more password handling)

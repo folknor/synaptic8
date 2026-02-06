@@ -250,7 +250,6 @@ pub enum AppState {
     ShowingChangelog,   // Viewing package changelog
     ShowingSettings,    // Settings/preferences view
     ConfirmExit,        // Confirm exit with pending changes
-    EnteringPassword,   // Entering sudo password
     Upgrading,
     Done,
 }
@@ -305,12 +304,6 @@ impl Default for Settings {
             sort_ascending: true,
         }
     }
-}
-
-/// Result of attempting to apply changes
-pub enum ApplyResult {
-    NeedsPassword,
-    NeedsCommit,
 }
 
 /// Result of toggling a package

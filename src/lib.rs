@@ -4,5 +4,6 @@
 
 pub mod apt;
 pub mod core;
+pub mod progress;
 pub mod search;
 pub mod types;

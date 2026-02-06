@@ -99,9 +99,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
             render_exit_confirm_modal(frame, app, main_chunks[1]);
         }
-        AppState::EnteringPassword => {
-            render_password_input(frame, app, main_chunks[1]);
-        }
         AppState::Upgrading | AppState::Done => {
             let output_text = app.output_lines.join("\n");
             let output = Paragraph::new(output_text)
@@ -119,7 +116,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
         AppState::ShowingSettings => Style::default().fg(Color::Yellow),
         AppState::ConfirmExit => Style::default().fg(Color::Red),
-        AppState::EnteringPassword => Style::default().fg(Color::Yellow),
         AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
     };
@@ -144,9 +140,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             if app.ui.visual_mode {
                 "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
             } else if app.core.search_result_count().is_some() {
-                "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ q:Quit"
+                "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ U:Update │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ q:Quit"
+                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ U:Update │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
@@ -155,7 +151,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::ShowingChangelog => "↑↓/PgUp/PgDn:Scroll │ Esc/q:Close",
         AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
         AppState::ConfirmExit => "y/Enter:Quit │ n/Esc:Cancel",
-        AppState::EnteringPassword => "Enter:Submit │ Esc:Cancel │ Type password...",
         AppState::Upgrading => "Applying changes...",
         AppState::Done => "r:Refresh │ q:Quit",
     };
@@ -171,9 +166,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             let cursor_x = main_chunks[2].x + 1 + 1 + app.core.search_query().len() as u16;
             let cursor_y = main_chunks[2].y + 1;
             frame.set_cursor_position((cursor_x, cursor_y));
-        }
-        AppState::EnteringPassword => {
-            // Cursor is handled by the password modal
         }
         _ => {}
     }
@@ -915,45 +907,3 @@ fn render_exit_confirm_modal(frame: &mut Frame, _app: &App, area: Rect) {
     frame.render_widget(modal, modal_area);
 }
 
-fn render_password_input(frame: &mut Frame, app: &App, area: Rect) {
-    let modal_width = 50.min(area.width.saturating_sub(4));
-    let modal_height = 8;
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-    frame.render_widget(Clear, modal_area);
-
-    let password_display = "*".repeat(app.sudo_password.len());
-    let lines = vec![
-        Line::from(""),
-        Line::from("Root privileges required."),
-        Line::from("Enter sudo password:"),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("[{password_display}]"),
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter: Submit │ Esc: Cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let modal = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Authentication ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .alignment(Alignment::Center);
-
-    frame.render_widget(modal, modal_area);
-
-    // Show cursor after password asterisks
-    let cursor_x = modal_area.x + (modal_area.width / 2) + (app.sudo_password.len() as u16 / 2) + 1;
-    let cursor_y = modal_area.y + 5;
-    frame.set_cursor_position((cursor_x, cursor_y));
-}
